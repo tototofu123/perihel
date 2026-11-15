@@ -21,10 +21,13 @@ at most one search/fetch per 5 s (MIN_GAP_S, same as ai.py's
 MIN_CALL_GAP_S) and at most 10 per rolling minute (MAX_PER_MINUTE).
 Over the limit the endpoint answers HTTP 429 with a retry_after hint.
 
-Summarising reuses ai.py's _nim_call (lazy import inside summarise() so
-this module stays importable without nim.key — a missing key only breaks
-summarisation, not search/fetch). A failed summary never fails the
-request: the first ~500 chars of the text are returned instead.
+Summarising reuses ai.py's nim_call_fallback (lazy import inside
+summarise() so this module stays importable without nim.key — a missing
+key only breaks summarisation, not search/fetch). A failed summary never
+fails the request: summarise() returns '' and the caller shows the
+snippet instead. It never returns raw source text as a "summary" — a
+dump of titles/URLs/snippets is not a summary (that was the daily
+digest bug of 2026-11-15).
 """
 import html as html_lib
 import os
@@ -46,7 +49,6 @@ SEARCH_TIMEOUT_S = 15       # one search request (RSS or HTML page)
 FETCH_TIMEOUT_S = 15        # one page fetch
 MAX_FETCH_BYTES = 2 * 1024 * 1024   # never download more than 2 MB
 SUMMARY_INPUT_CHARS = 6000  # chars of text sent to the model
-SUMMARY_FALLBACK_CHARS = 500
 
 # ---------------- rate limit ----------------
 
@@ -162,8 +164,57 @@ def _search_bing_rss(query: str, max_results: int) -> list[dict]:
             continue
         out.append({"title": _clean(item.findtext("title")),
                     "url": link,
-                    "snippet": _clean(item.findtext("description"))})
+                    "snippet": _clean(item.findtext("description")),
+                    "pub_date": _clean(item.findtext("pubDate"))})
         if len(out) >= max_results:
+            break
+    return out
+
+
+ATOM_NS = "{http://www.w3.org/2005/Atom}"
+
+
+def _atom_link(entry) -> str:
+    """The article URL of an Atom entry: the rel=alternate link, else
+    the first link's href. Pure."""
+    for link in entry.findall(f"{ATOM_NS}link"):
+        if link.get("rel") in (None, "alternate"):
+            return link.get("href") or ""
+    return ""
+
+
+def fetch_rss_feed(url: str, max_items: int = 5) -> list[dict]:
+    """Fetch one RSS 2.0 or Atom feed and return its newest items as
+    [{title, url, snippet, pub_date}]. Raises on HTTP / network /
+    parse failure; returns [] only when the feed genuinely has no
+    items. The caller decides what to do with a failed feed (the
+    digest just skips it and uses the other feeds)."""
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+    with urllib.request.urlopen(req, timeout=SEARCH_TIMEOUT_S) as resp:
+        tree = ET.fromstring(resp.read())
+    out = []
+    # RSS 2.0: channel/item
+    for item in tree.iter("item"):
+        link = _clean(item.findtext("link"))
+        if not link:
+            continue
+        out.append({"title": _clean(item.findtext("title")),
+                    "url": link,
+                    "snippet": _clean(item.findtext("description")),
+                    "pub_date": _clean(item.findtext("pubDate"))})
+        if len(out) >= max_items:
+            return out
+    # Atom: feed/entry (namespaced)
+    for entry in tree.iter(f"{ATOM_NS}entry"):
+        link = _atom_link(entry)
+        if not link:
+            continue
+        out.append({"title": _clean(entry.findtext(f"{ATOM_NS}title")),
+                    "url": link,
+                    "snippet": _clean(entry.findtext(f"{ATOM_NS}summary")),
+                    "pub_date": _clean(entry.findtext(f"{ATOM_NS}published"))
+                                or _clean(entry.findtext(f"{ATOM_NS}updated"))})
+        if len(out) >= max_items:
             break
     return out
 
@@ -211,10 +262,11 @@ def _search_bing_html(query: str, max_results: int) -> list[dict]:
 
 
 def search(query: str, max_results: int = 5) -> list[dict]:
-    """Web search. Returns [{title, url, snippet}]. RSS first; HTML only
-    when RSS fails or returns nothing. Raises only when both providers
-    fail (network / HTTP error) — the endpoint turns that into a 502.
-    An empty list means the search worked and found nothing."""
+    """Web search. Returns [{title, url, snippet, pub_date}]. RSS first;
+    HTML only when RSS fails or returns nothing (HTML items carry no
+    pub_date). Raises only when both providers fail (network / HTTP
+    error) — the endpoint turns that into a 502. An empty list means
+    the search worked and found nothing."""
     query = (query or "").strip()
     if not query:
         raise ValueError("empty query")
@@ -229,28 +281,69 @@ def search(query: str, max_results: int = 5) -> list[dict]:
 
 # ---------------- fetch ----------------
 
+JINA_READER_PREFIX = "https://r.jina.ai/"
+
+
+def _fetch_jina(url: str, max_chars: int) -> str:
+    """Fetch a page via Jina AI Reader (https://r.jina.ai/<url>): a
+    hosted reader that returns clean Markdown, JS-rendered, no key
+    needed on the free tier. Used only as a fallback when the direct
+    fetch fails or returns almost no text (JS-heavy / thin pages).
+    It does NOT bypass access controls — a site that 401s still 401s.
+    Raises on failure, like fetch()."""
+    req = urllib.request.Request(
+        JINA_READER_PREFIX + url,
+        headers={"User-Agent": BROWSER_UA,
+                 "Accept": "text/plain, text/markdown, */*;q=0.1"})
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        raw = resp.read(MAX_FETCH_BYTES)
+    text = raw.decode("utf-8", errors="replace")
+    # Jina prepends a metadata header ("Title: ... URL Source: ...
+    # Markdown Content:") — drop everything up to the content marker.
+    marker = "Markdown Content:"
+    if marker in text:
+        text = text.split(marker, 1)[1]
+    return _collapse(text)[:max_chars]
+
+
 def fetch(url: str, max_chars: int = 8000) -> str:
     """Fetch a URL and return readable text, capped at max_chars.
-    Rejects non-http(s) URLs and non-text content types."""
+    Rejects non-http(s) URLs and non-text content types. When the
+    direct fetch fails or returns almost no readable text (a
+    JS-heavy page, a thin portal), retries once through Jina Reader
+    before giving up."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ValueError("only http(s) URLs can be fetched")
-    req = urllib.request.Request(
-        url, headers={"User-Agent": BROWSER_UA,
-                      "Accept": "text/html, text/plain, */*;q=0.1"})
-    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S) as resp:
-        ctype = resp.headers.get_content_type()
-        if ctype not in ("text/html", "application/xhtml+xml") \
-                and not ctype.startswith("text/"):
-            raise ValueError(f"not a text page (Content-Type: {ctype})")
-        charset = resp.headers.get_content_charset() or "utf-8"
-        raw = resp.read(MAX_FETCH_BYTES)
-    text = raw.decode(charset, errors="replace")
-    if ctype in ("text/html", "application/xhtml+xml"):
-        text = html_to_text(text)
-    else:
-        text = _collapse(text)
-    return text[:max_chars]
+    direct_error = None
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": BROWSER_UA,
+                          "Accept": "text/html, text/plain, */*;q=0.1"})
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S) as resp:
+            ctype = resp.headers.get_content_type()
+            if ctype not in ("text/html", "application/xhtml+xml") \
+                    and not ctype.startswith("text/"):
+                raise ValueError(f"not a text page (Content-Type: {ctype})")
+            charset = resp.headers.get_content_charset() or "utf-8"
+            raw = resp.read(MAX_FETCH_BYTES)
+        text = raw.decode(charset, errors="replace")
+        if ctype in ("text/html", "application/xhtml+xml"):
+            text = html_to_text(text)
+        else:
+            text = _collapse(text)
+        if len(text.strip()) >= 300:
+            return text[:max_chars]
+        direct_error = ValueError("page returned almost no readable text")
+    except Exception as e:
+        direct_error = e
+    try:
+        text = _fetch_jina(url, max_chars)
+    except Exception:
+        raise direct_error
+    if len(text.strip()) < 300:
+        raise direct_error
+    return text
 
 
 # ---------------- summarise ----------------
@@ -259,29 +352,53 @@ SUMMARY_SYSTEM = ("You summarise web text. Reply with a short, factual "
                   "summary (3-6 sentences, no preamble, no invented "
                   "details).")
 
+ITEM_SYSTEM = ("You summarise one news article. Reply with exactly "
+               "2 sentences, in your own words: sentence 1 — what "
+               "happened and who is involved; sentence 2 — why it "
+               "matters, with enough context that a reader who never "
+               "opens the article understands the story. Exactly 2 "
+               "sentences, no more, no fewer. Do NOT copy sentences "
+               "from the article — write a real summary. No preamble, "
+               "no invented details, no repeating the site's own "
+               "description of itself.")
+
 
 def summarise(text: str, query: str | None = None,
-              model: str | None = None) -> str:
+              model: str | None = None, system: str | None = None) -> str:
     """Summarise fetched/search text with the NIM model. `model` is a
     per-call override; None means PERIHEL_SEARCH_MODEL, and that unset
-    means the server default (ai.py MODEL). Never raises: on empty text
-    returns ''; on a NIM failure returns the first ~500 chars so the
-    caller still has something to show."""
+    means the server default (ai.py MODEL). `system` overrides the
+    system prompt (the digest passes ITEM_SYSTEM for per-item
+    summaries). Never raises: on empty text returns ''; on a NIM
+    failure returns '' too — the caller falls back to the snippet.
+    Raw source text is never returned as a "summary".
+    Uses nim_call_fallback (not _nim_call) so a dead model — e.g. the
+    retired default llama-3.2-11b-vision-instruct, which 410s — falls
+    through to Laguna / Bolt / MiniMax instead of failing outright."""
     text = (text or "").strip()
     if not text:
         return ""
+    use_model = model or SEARCH_MODEL or None
+    user = "Summarise this text"
+    if query:
+        user += f" for the question: {query}"
+    user += f":\n\n{text[:SUMMARY_INPUT_CHARS]}"
+    messages = [{"role": "system", "content": system or SUMMARY_SYSTEM},
+                {"role": "user", "content": user}]
     try:
-        from ai import _nim_call  # lazy: keeps this module importable
-        # without nim.key (only summarisation needs the key)
-        use_model = model or SEARCH_MODEL or None
-        user = "Summarise this text"
-        if query:
-            user += f" for the question: {query}"
-        user += f":\n\n{text[:SUMMARY_INPUT_CHARS]}"
-        resp = _nim_call([{"role": "system", "content": SUMMARY_SYSTEM},
-                          {"role": "user", "content": user}],
-                         timeout=30, model=use_model, role="worker")
-        out = resp["choices"][0]["message"]["content"].strip()
-        return out or text[:SUMMARY_FALLBACK_CHARS]
+        from ai import nim_call_fallback  # lazy: keeps this module
+        # importable without nim.key (only summarisation needs the key)
+        resp, _used = nim_call_fallback(messages, timeout=30,
+                                        model=use_model, role="worker")
+        return resp["choices"][0]["message"]["content"].strip()
     except Exception:
-        return text[:SUMMARY_FALLBACK_CHARS]
+        pass
+    # NIM chain down: try Gemini (Google AI Studio free tier) with the
+    # same messages before giving up. No gemini.key on the VM just
+    # means this step is skipped, same as before.
+    try:
+        from ai import gemini_call  # lazy, same reason as above
+        resp = gemini_call(messages, timeout=30)
+        return resp["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return ""

@@ -209,18 +209,23 @@ def _typing_loop(chat_id: int, stop: threading.Event):
 
 
 def send_telegram(chat_id: int, text: str, reply_to: int | None = None,
-                  raw_html: bool = False) -> bool:
+                  raw_html: bool = False,
+                  preview_url: str | None = None) -> bool:
     """Send a message to one chat. Safe to import from tick.py: returns
     False (never raises) when the bot is not configured or Telegram
     rejects the call. raw_html=True sends pre-formatted Telegram HTML
     as-is (the caller must escape its own data first — the digest does);
-    the default escapes the text (plain messages)."""
+    the default escapes the text (plain messages). preview_url pins
+    Telegram's link preview (the article's image card) to that URL
+    instead of the first link in the text."""
     try:
         payload = {"chat_id": chat_id,
                    "text": text if raw_html else format_reply(text),
                    "parse_mode": "HTML"}
         if reply_to is not None:
             payload["reply_to_message_id"] = reply_to
+        if preview_url:
+            payload["link_preview_options"] = {"url": preview_url}
         out = tg_api("sendMessage", payload, timeout=15)
         return bool(out.get("ok"))
     except Exception as e:
