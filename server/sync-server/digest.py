@@ -14,7 +14,12 @@ generally, but it cannot trigger this one.
 
 Sections — defaults, each configurable (see below):
   - AI news: the search worker (search.py) for "artificial intelligence
-    news", top 5 results, summarised by the worker role's model.
+    news", top 5 results. Each result page is fetched and summarised
+    to 1-2 sentences by the worker role's model, so the section says
+    what actually happened — never a dump of titles/URLs/snippets
+    (that was the 2026-11-15 bug: summarise() failed on the retired
+    default model and returned raw text as the "summary"). A failed
+    item summary falls back to that item's snippet.
   - Repos: open PRs and open issues (most recently updated first, max 5
     each) for PERIHEL_DIGEST_REPOS (comma-separated owner/repo;
     default agent-bus, perihel-v2, hkust-climbing-app), via the GitHub
@@ -222,9 +227,35 @@ def get_search_module():
         return None
 
 
+ITEM_FETCH_CHARS = 4000  # chars of each news page sent to the model
+
+
+def _summarise_item(search_mod, item: dict) -> str:
+    """One news item -> a 1-2 sentence summary of what is on its page.
+    Fetches the page and summarises the page text (search-result titles
+    and snippets alone are mostly site descriptions, not news). A fetch
+    or summary failure falls back to the item's snippet; an empty
+    snippet means no summary line. Never returns raw page text."""
+    snippet = (item.get("snippet") or "").strip()
+    url = item.get("url") or ""
+    if not url:
+        return snippet
+    try:
+        page_text = search_mod.fetch(url, max_chars=ITEM_FETCH_CHARS)
+    except Exception:
+        return snippet
+    if not (page_text or "").strip():
+        return snippet
+    summary = search_mod.summarise(page_text, system=search_mod.ITEM_SYSTEM)
+    return summary.strip() if summary else snippet
+
+
 def fetch_news(search_mod) -> dict:
-    """Top AI-news results + a short summary (worker role's model).
-    Never raises: a failure becomes an "error" note for the section."""
+    """Top AI-news results, each with a 1-2 sentence summary of its
+    page (worker role's model). Never raises: a failure becomes an
+    "error" note for the section. The returned items carry a "summary"
+    key; the top-level "summary" is kept (empty) for callers that read
+    it. No raw search text is ever shown as a summary."""
     if search_mod is None:
         return {"available": False, "count": 0, "items": [],
                 "summary": "",
@@ -239,12 +270,10 @@ def fetch_news(search_mod) -> dict:
         return {"available": False, "count": 0, "items": [],
                 "summary": "",
                 "error": "AI news unavailable today (no results)"}
-    joined = "\n\n".join(
-        f"{r.get('title', '')}\n{r.get('url', '')}\n{r.get('snippet', '')}"
-        for r in items)
-    summary = search_mod.summarise(joined, query=NEWS_QUERY)
+    for item in items:
+        item["summary"] = _summarise_item(search_mod, item)
     return {"available": True, "count": len(items), "items": items,
-            "summary": summary, "error": None}
+            "summary": "", "error": None}
 
 
 # ---------------- build + format ----------------
@@ -315,10 +344,10 @@ def format_digest(data: dict) -> str:
     if not news["available"]:
         lines.append(news["error"] or "AI news unavailable today.")
     else:
-        if news["summary"]:
-            lines.append(_esc(news["summary"]))
         for item in news["items"]:
             lines.append(f"• {_link(item['url'], item['title'])}")
+            if item.get("summary"):
+                lines.append(f"  {_esc(item['summary'])}")
     lines.append("")
 
     # --- repos ---

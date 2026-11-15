@@ -21,10 +21,13 @@ at most one search/fetch per 5 s (MIN_GAP_S, same as ai.py's
 MIN_CALL_GAP_S) and at most 10 per rolling minute (MAX_PER_MINUTE).
 Over the limit the endpoint answers HTTP 429 with a retry_after hint.
 
-Summarising reuses ai.py's _nim_call (lazy import inside summarise() so
-this module stays importable without nim.key — a missing key only breaks
-summarisation, not search/fetch). A failed summary never fails the
-request: the first ~500 chars of the text are returned instead.
+Summarising reuses ai.py's nim_call_fallback (lazy import inside
+summarise() so this module stays importable without nim.key — a missing
+key only breaks summarisation, not search/fetch). A failed summary never
+fails the request: summarise() returns '' and the caller shows the
+snippet instead. It never returns raw source text as a "summary" — a
+dump of titles/URLs/snippets is not a summary (that was the daily
+digest bug of 2026-11-15).
 """
 import html as html_lib
 import os
@@ -46,7 +49,6 @@ SEARCH_TIMEOUT_S = 15       # one search request (RSS or HTML page)
 FETCH_TIMEOUT_S = 15        # one page fetch
 MAX_FETCH_BYTES = 2 * 1024 * 1024   # never download more than 2 MB
 SUMMARY_INPUT_CHARS = 6000  # chars of text sent to the model
-SUMMARY_FALLBACK_CHARS = 500
 
 # ---------------- rate limit ----------------
 
@@ -259,29 +261,40 @@ SUMMARY_SYSTEM = ("You summarise web text. Reply with a short, factual "
                   "summary (3-6 sentences, no preamble, no invented "
                   "details).")
 
+ITEM_SYSTEM = ("You summarise one news page. Reply with 1-2 sentences "
+               "about the top story (or top 2-3 stories, if the page "
+               "lists several): what happened, in plain words. No "
+               "preamble, no invented details, no repeating the page's "
+               "own description of itself.")
+
 
 def summarise(text: str, query: str | None = None,
-              model: str | None = None) -> str:
+              model: str | None = None, system: str | None = None) -> str:
     """Summarise fetched/search text with the NIM model. `model` is a
     per-call override; None means PERIHEL_SEARCH_MODEL, and that unset
-    means the server default (ai.py MODEL). Never raises: on empty text
-    returns ''; on a NIM failure returns the first ~500 chars so the
-    caller still has something to show."""
+    means the server default (ai.py MODEL). `system` overrides the
+    system prompt (the digest passes ITEM_SYSTEM for per-item
+    summaries). Never raises: on empty text returns ''; on a NIM
+    failure returns '' too — the caller falls back to the snippet.
+    Raw source text is never returned as a "summary".
+    Uses nim_call_fallback (not _nim_call) so a dead model — e.g. the
+    retired default llama-3.2-11b-vision-instruct, which 410s — falls
+    through to Laguna / Bolt / MiniMax instead of failing outright."""
     text = (text or "").strip()
     if not text:
         return ""
     try:
-        from ai import _nim_call  # lazy: keeps this module importable
-        # without nim.key (only summarisation needs the key)
+        from ai import nim_call_fallback  # lazy: keeps this module
+        # importable without nim.key (only summarisation needs the key)
         use_model = model or SEARCH_MODEL or None
         user = "Summarise this text"
         if query:
             user += f" for the question: {query}"
         user += f":\n\n{text[:SUMMARY_INPUT_CHARS]}"
-        resp = _nim_call([{"role": "system", "content": SUMMARY_SYSTEM},
-                          {"role": "user", "content": user}],
-                         timeout=30, model=use_model, role="worker")
-        out = resp["choices"][0]["message"]["content"].strip()
-        return out or text[:SUMMARY_FALLBACK_CHARS]
+        resp, _used = nim_call_fallback(
+            [{"role": "system", "content": system or SUMMARY_SYSTEM},
+             {"role": "user", "content": user}],
+            timeout=30, model=use_model, role="worker")
+        return resp["choices"][0]["message"]["content"].strip()
     except Exception:
-        return text[:SUMMARY_FALLBACK_CHARS]
+        return ""
