@@ -171,56 +171,52 @@ def _search_bing_rss(query: str, max_results: int) -> list[dict]:
     return out
 
 
-def _decode_bing_news_link(href: str) -> str:
-    """Bing News RSS wraps destinations in apiclick.aspx links with the
-    real URL in the `url` query param (percent-encoded). Decode it;
-    keep the original link when there is nothing to decode — it still
-    works in a browser (Bing redirects). Pure."""
-    try:
-        qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
-        real = qs.get("url", [None])[0]
-        if real:
-            return urllib.parse.unquote(real)
-    except Exception:
-        pass
-    return href
+ATOM_NS = "{http://www.w3.org/2005/Atom}"
 
 
-def _search_bing_news_rss(query: str, max_results: int) -> list[dict]:
-    """Bing News RSS: real news *articles* (not section homepages),
-    each with a title, destination link, description and pubDate.
-    Raises on HTTP / network / parse failure; returns [] only when
-    Bing genuinely has no items for the query."""
-    params = urllib.parse.urlencode(
-        {"q": query, "format": "rss", "count": max_results})
-    req = urllib.request.Request(
-        f"https://www.bing.com/news/search?{params}",
-        headers={"User-Agent": BROWSER_UA})
+def _atom_link(entry) -> str:
+    """The article URL of an Atom entry: the rel=alternate link, else
+    the first link's href. Pure."""
+    for link in entry.findall(f"{ATOM_NS}link"):
+        if link.get("rel") in (None, "alternate"):
+            return link.get("href") or ""
+    return ""
+
+
+def fetch_rss_feed(url: str, max_items: int = 5) -> list[dict]:
+    """Fetch one RSS 2.0 or Atom feed and return its newest items as
+    [{title, url, snippet, pub_date}]. Raises on HTTP / network /
+    parse failure; returns [] only when the feed genuinely has no
+    items. The caller decides what to do with a failed feed (the
+    digest just skips it and uses the other feeds)."""
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
     with urllib.request.urlopen(req, timeout=SEARCH_TIMEOUT_S) as resp:
         tree = ET.fromstring(resp.read())
     out = []
+    # RSS 2.0: channel/item
     for item in tree.iter("item"):
-        link = _decode_bing_news_link(_clean(item.findtext("link")))
+        link = _clean(item.findtext("link"))
         if not link:
             continue
         out.append({"title": _clean(item.findtext("title")),
                     "url": link,
                     "snippet": _clean(item.findtext("description")),
                     "pub_date": _clean(item.findtext("pubDate"))})
-        if len(out) >= max_results:
+        if len(out) >= max_items:
+            return out
+    # Atom: feed/entry (namespaced)
+    for entry in tree.iter(f"{ATOM_NS}entry"):
+        link = _atom_link(entry)
+        if not link:
+            continue
+        out.append({"title": _clean(entry.findtext(f"{ATOM_NS}title")),
+                    "url": link,
+                    "snippet": _clean(entry.findtext(f"{ATOM_NS}summary")),
+                    "pub_date": _clean(entry.findtext(f"{ATOM_NS}published"))
+                                or _clean(entry.findtext(f"{ATOM_NS}updated"))})
+        if len(out) >= max_items:
             break
     return out
-
-
-def search_news(query: str, max_results: int = 5) -> list[dict]:
-    """News search: real articles via Bing News RSS. Returns
-    [{title, url, snippet, pub_date}]; [] when the feed fails or has
-    nothing (never raises — the digest treats that as an unavailable
-    section and falls back to web search)."""
-    try:
-        return _search_bing_news_rss(query, max_results)
-    except Exception:
-        return []
 
 
 def _resolve_bing_link(href: str) -> str:
@@ -285,28 +281,69 @@ def search(query: str, max_results: int = 5) -> list[dict]:
 
 # ---------------- fetch ----------------
 
+JINA_READER_PREFIX = "https://r.jina.ai/"
+
+
+def _fetch_jina(url: str, max_chars: int) -> str:
+    """Fetch a page via Jina AI Reader (https://r.jina.ai/<url>): a
+    hosted reader that returns clean Markdown, JS-rendered, no key
+    needed on the free tier. Used only as a fallback when the direct
+    fetch fails or returns almost no text (JS-heavy / thin pages).
+    It does NOT bypass access controls — a site that 401s still 401s.
+    Raises on failure, like fetch()."""
+    req = urllib.request.Request(
+        JINA_READER_PREFIX + url,
+        headers={"User-Agent": BROWSER_UA,
+                 "Accept": "text/plain, text/markdown, */*;q=0.1"})
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        raw = resp.read(MAX_FETCH_BYTES)
+    text = raw.decode("utf-8", errors="replace")
+    # Jina prepends a metadata header ("Title: ... URL Source: ...
+    # Markdown Content:") — drop everything up to the content marker.
+    marker = "Markdown Content:"
+    if marker in text:
+        text = text.split(marker, 1)[1]
+    return _collapse(text)[:max_chars]
+
+
 def fetch(url: str, max_chars: int = 8000) -> str:
     """Fetch a URL and return readable text, capped at max_chars.
-    Rejects non-http(s) URLs and non-text content types."""
+    Rejects non-http(s) URLs and non-text content types. When the
+    direct fetch fails or returns almost no readable text (a
+    JS-heavy page, a thin portal), retries once through Jina Reader
+    before giving up."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ValueError("only http(s) URLs can be fetched")
-    req = urllib.request.Request(
-        url, headers={"User-Agent": BROWSER_UA,
-                      "Accept": "text/html, text/plain, */*;q=0.1"})
-    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S) as resp:
-        ctype = resp.headers.get_content_type()
-        if ctype not in ("text/html", "application/xhtml+xml") \
-                and not ctype.startswith("text/"):
-            raise ValueError(f"not a text page (Content-Type: {ctype})")
-        charset = resp.headers.get_content_charset() or "utf-8"
-        raw = resp.read(MAX_FETCH_BYTES)
-    text = raw.decode(charset, errors="replace")
-    if ctype in ("text/html", "application/xhtml+xml"):
-        text = html_to_text(text)
-    else:
-        text = _collapse(text)
-    return text[:max_chars]
+    direct_error = None
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": BROWSER_UA,
+                          "Accept": "text/html, text/plain, */*;q=0.1"})
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S) as resp:
+            ctype = resp.headers.get_content_type()
+            if ctype not in ("text/html", "application/xhtml+xml") \
+                    and not ctype.startswith("text/"):
+                raise ValueError(f"not a text page (Content-Type: {ctype})")
+            charset = resp.headers.get_content_charset() or "utf-8"
+            raw = resp.read(MAX_FETCH_BYTES)
+        text = raw.decode(charset, errors="replace")
+        if ctype in ("text/html", "application/xhtml+xml"):
+            text = html_to_text(text)
+        else:
+            text = _collapse(text)
+        if len(text.strip()) >= 300:
+            return text[:max_chars]
+        direct_error = ValueError("page returned almost no readable text")
+    except Exception as e:
+        direct_error = e
+    try:
+        text = _fetch_jina(url, max_chars)
+    except Exception:
+        raise direct_error
+    if len(text.strip()) < 300:
+        raise direct_error
+    return text
 
 
 # ---------------- summarise ----------------
@@ -315,14 +352,15 @@ SUMMARY_SYSTEM = ("You summarise web text. Reply with a short, factual "
                   "summary (3-6 sentences, no preamble, no invented "
                   "details).")
 
-ITEM_SYSTEM = ("You summarise one news article. Reply with 2-3 "
-               "sentences TOTAL, in your own words: what happened, who "
-               "is involved, and why it matters, with enough context "
-               "that a reader who never opens the article understands "
-               "the story. Do NOT copy sentences from the article — "
-               "write a real summary. No preamble, no invented "
-               "details, no repeating the site's own description of "
-               "itself.")
+ITEM_SYSTEM = ("You summarise one news article. Reply with exactly "
+               "2 sentences, in your own words: sentence 1 — what "
+               "happened and who is involved; sentence 2 — why it "
+               "matters, with enough context that a reader who never "
+               "opens the article understands the story. Exactly 2 "
+               "sentences, no more, no fewer. Do NOT copy sentences "
+               "from the article — write a real summary. No preamble, "
+               "no invented details, no repeating the site's own "
+               "description of itself.")
 
 
 def summarise(text: str, query: str | None = None,

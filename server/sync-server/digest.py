@@ -13,17 +13,21 @@ VM itself; the bus scheduler stays the mechanism for scheduled jobs
 generally, but it cannot trigger this one.
 
 Sections — defaults, each configurable (see below):
-  - AI news: real news *articles* via the search worker's Bing News
-    RSS (search_news), top 5 usable. Each article is fetched and
-    summarised to 2-3 sentences by the worker role's model — a real
-    summary of one story, not cropped fragments off a section
-    homepage (that was the 2026-11-15 bug: homepages are a jumble of
-    headlines, so the model just lifted sentences off the page).
-    Market/stock-tip junk is filtered out, and an unfetchable article
-    is dropped and replaced. Every item carries a subheading with its
-    source and publish date AND time (HKT) next to the link. When the
-    news feed yields nothing usable, the section falls back to web
-    search results (section pages) rather than coming up empty.
+  - AI news: real news *articles* from a fixed list of trusted
+    sources (NEWS_FEEDS), each read straight from its own RSS/Atom
+    feed — no search engine in the loop at all (Bing News was tried
+    2026-11-15 and dropped the same evening: its results were mostly
+    stock-market spam, and it still returned section pages). Each
+    article is fetched and summarised to 2 sentences by the worker
+    role's model — a real summary of one story, in the model's own
+    words, not cropped fragments off a section homepage (that was
+    the 2026-11-15 bug: homepages are a jumble of headlines, so the
+    model just lifted sentences off the page, and once asked "Which
+    specific article would you like me to summarise?"). General-tech
+    feeds are filtered to AI stories by keyword. An unfetchable
+    article is dropped and replaced; a failed feed is skipped and
+    the other feeds fill in. Every item carries a subheading with
+    its source and publish date AND time (HKT) next to the link.
   - Repos: open PRs and open issues (most recently updated first, max 5
     each) for PERIHEL_DIGEST_REPOS (comma-separated owner/repo;
     default agent-bus, perihel-v2, hkust-climbing-app), via the GitHub
@@ -55,11 +59,29 @@ PLANS_PATH = os.path.join(DATA_DIR, "plans.md")
 
 DEFAULT_REPOS = ["tototofu123/agent-bus", "tototofu123/perihel-v2",
                  "HKUST-Climbing-Society/hkust-climbing-app"]
-NEWS_QUERY = "artificial intelligence"  # Bing News RSS query
-WEB_NEWS_QUERY = "artificial intelligence news"  # web-search fallback
+# Trusted news sources, read straight from their own RSS/Atom feeds.
+# (name, feed URL). A feed that fails or has nothing fresh is skipped
+# and the others fill in. Reuters is NOT here: it blocks fetches
+# (401) and its feed is unusable from the VM. AI News is NOT here
+# either: its feed returns non-XML. To add or remove a source, edit
+# this list — nothing else needs to change.
+NEWS_FEEDS = [
+    ("ScienceDaily", "https://www.sciencedaily.com/rss/computers_math/artificial_intelligence.xml"),
+    ("MIT News", "https://news.mit.edu/rss/topic/artificial-intelligence2"),
+    ("TechCrunch", "https://techcrunch.com/category/artificial-intelligence/feed/"),
+    ("Wired", "https://www.wired.com/feed/tag/ai/latest/rss"),
+    ("BBC", "https://feeds.bbci.co.uk/news/technology/rss.xml"),
+    ("CNBC", "https://www.cnbc.com/id/19854910/device/rss/rss.html"),
+    ("The Verge", "https://www.theverge.com/rss/index.xml"),
+    ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+    ("The Guardian", "https://www.theguardian.com/technology/rss"),
+]
 NEWS_MAX_RESULTS = 5
-NEWS_SEARCH_RESULTS = 16  # news articles fetched; the first usable 5
-                          # are kept after junk filtering
+FEED_MAX_ITEMS = 4  # newest items taken from each feed (top 2 first,
+                    # then the rest if more slots need filling)
+SUMMARY_MAX_CHARS = 380  # per-item summary cap — the whole digest
+                         # must fit in ONE Telegram message (4096
+                         # chars), so summaries stay to 2 sentences
 REPO_MAX_ITEMS = 5        # per repo, per kind (PRs / issues)
 PLANS_MAX_LINES = 10
 GITHUB_TIMEOUT_S = 15
@@ -264,6 +286,8 @@ _SOURCE_NAMES = {
     "nsf.gov": "NSF",
     "msn.com": "MSN",
     "whitehouse.gov": "White House",
+    "bbc.com": "BBC",
+    "arstechnica.com": "Ars Technica",
 }
 
 # A "summary" that is just the site describing itself, not news
@@ -287,17 +311,57 @@ _GENERIC_PHRASES = (
     "no article to summarize",
     "as an ai language model",
     "i don't have access to",
+    # The model asking the reader a question instead of summarising
+    # ("This text is a homepage listing... Which specific article
+    # would you like me to summarise?") — that happened 2026-11-15
+    # when a section homepage was summarised instead of an article.
+    "which specific article",
+    "which article would you like",
+    "would you like me to summarise",
+    "would you like me to summarize",
 )
 
 
 def _looks_generic(summary: str) -> bool:
-    """True when a summary is a site blurb rather than news. Pure."""
+    """True when a summary is a site blurb, a model refusal, or the
+    model asking the reader a question — rather than news. A real
+    2-sentence summary never contains a question mark. Pure."""
     text = (summary or "").strip().lower()
     if not text:
         return True
     if len(text) < 40:
         return True
+    if "?" in text:
+        return True
     return any(phrase in text for phrase in _GENERIC_PHRASES)
+
+
+# Words that mark a story as AI-related. The general-tech feeds (BBC,
+# CNBC, The Verge, Ars, Guardian) cover all of tech, so their items
+# are filtered to AI stories; the AI-specific feeds pass everything.
+# Single words are matched on word boundaries ("ai" must not match
+# "said"; "agent" must not match "management"); multi-word phrases
+# are matched as substrings.
+_AI_WORDS = (
+    "ai", "llm", "gpu", "agent", "agents", "robot", "robots",
+    "neural", "gemini", "chatbot",
+    # NOTE: "copilot" is deliberately NOT here — too many non-AI
+    # Microsoft stories mention Copilot in passing (outages, 365
+    # updates) and would slip through the filter.
+)
+_AI_PHRASES = (
+    "artificial intelligence", "machine learning", "openai",
+    "anthropic", "deepmind", "nvidia", "generative", "chatgpt",
+)
+
+
+def _is_ai_relevant(item: dict) -> bool:
+    """True when a news item's title/snippet is about AI. Pure."""
+    text = f"{item.get('title') or ''} {item.get('snippet') or ''}".lower()
+    words = set(re.findall(r"[a-z0-9]+", text))
+    if words & set(_AI_WORDS):
+        return True
+    return any(phrase in text for phrase in _AI_PHRASES)
 
 
 def _source_name(url: str) -> str:
@@ -352,11 +416,38 @@ def _is_market_junk(item: dict) -> bool:
     return any(word in text for word in _MARKET_WORDS)
 
 
+# Sentence-ending abbreviations: "and U.S." ends with a period but is
+# NOT a finished sentence (this fooled the clean-end check on a CNBC
+# item, 2026-11-15 — the digest showed a dangling "and U.S.").
+_ABBREV_TAILS = ("u.s.", "u.k.", "mr.", "mrs.", "ms.", "dr.",
+                 "e.g.", "i.e.", "etc.", "vs.", "no.")
+
+
+def _pub_age_hours(pub_date: str | None) -> float | None:
+    """Age of an RSS pubDate in hours, or None when it cannot be
+    parsed. Pure."""
+    if not pub_date:
+        return None
+    try:
+        from datetime import timezone
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(pub_date.strip())
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+    except Exception:
+        return None
+
+
 def _ends_cleanly(text: str) -> bool:
     """True when a summary ends on a finished sentence, not mid-thought
-    ('...clinical operations, research,'). Pure."""
+    ('...clinical operations, research,' or '...and U.S.'). Pure."""
     tail = (text or "").strip().rstrip("\"'”’)]")
-    return bool(tail) and tail[-1] in ".!?…"
+    if not tail:
+        return False
+    if tail.lower().endswith(_ABBREV_TAILS):
+        return False
+    return tail[-1] in ".!?…"
 
 
 def _trim_to_last_sentence(text: str) -> str:
@@ -368,13 +459,15 @@ def _trim_to_last_sentence(text: str) -> str:
     if _ends_cleanly(text):
         return text
     cuts = [m.end() for m in re.finditer(r"[.!?]\s+", text)]
-    if not cuts:
-        return ""
-    return text[:cuts[-1]].strip()
+    for cut in reversed(cuts):
+        candidate = text[:cut].strip()
+        if _ends_cleanly(candidate):
+            return candidate
+    return ""
 
 
 def _summarise_item(search_mod, item: dict) -> str:
-    """One news item -> a 2-3 sentence summary of what is on its page.
+    """One news item -> a 2-sentence summary of what is on its page.
     Fetches the page and summarises the page text (search-result titles
     and snippets alone are mostly site descriptions, not news). Returns
     '' when the page cannot be fetched at all — the caller drops the
@@ -405,20 +498,29 @@ def _summarise_item(search_mod, item: dict) -> str:
             summary = retry
     if summary:
         summary = _trim_to_last_sentence(summary)
+        if len(summary) > SUMMARY_MAX_CHARS:
+            # Cap the length (one Telegram message, 4096 chars total):
+            # cut back to the last finished sentence inside the cap.
+            summary = _trim_to_last_sentence(summary[:SUMMARY_MAX_CHARS])
         if summary:
             return summary
     return snippet
 
 
 def _keep_items(search_mod, items: list[dict],
-                require_date: bool = False) -> list[dict]:
+                require_date: bool = False,
+                ai_filter: bool = False,
+                max_age_hours: float | None = None) -> list[dict]:
     """Summarise a list of candidate items, keeping the first
     NEWS_MAX_RESULTS usable ones: one per domain, not market junk, a
-    real (non-generic, finished) summary. With require_date (the news
-    feed), an item with no fresh publish date is skipped too — a news
-    article with no date is usually an evergreen/landing page, not
-    news. Pure except for the fetches and NIM calls inside
-    _summarise_item."""
+    real (non-generic, finished) summary. With require_date, an item
+    with no fresh publish date is skipped too — a news article with
+    no date is usually an evergreen/landing page, not news. With
+    max_age_hours, only items published within that many hours are
+    kept (the daily digest wants the last 24 hours). With ai_filter,
+    only AI-related stories are kept. The source is the feed name
+    when the item came from a feed, else the domain. Pure except for
+    the fetches and NIM calls inside _summarise_item."""
     kept = []
     seen_domains = set()
     for item in items:
@@ -426,65 +528,66 @@ def _keep_items(search_mod, items: list[dict],
             break
         if _is_market_junk(item):
             continue
+        if ai_filter and not _is_ai_relevant(item):
+            continue
         domain = _domain(item.get("url") or "")
         if domain and domain in seen_domains:
             continue
         date, time = _format_datetime(item.get("pub_date"))
         if require_date and not date:
             continue
+        if max_age_hours is not None:
+            age = _pub_age_hours(item.get("pub_date"))
+            if age is None or age < -1 or age > max_age_hours:
+                continue
         summary = _summarise_item(search_mod, item)
         if not summary or _looks_generic(summary):
             continue
         if domain:
             seen_domains.add(domain)
         item["summary"] = summary
-        item["source"] = _source_name(item.get("url") or "")
+        item["source"] = item.get("feed") or _source_name(item.get("url") or "")
         item["date"], item["time"] = date, time
         kept.append(item)
     return kept
 
 
 def fetch_news(search_mod) -> dict:
-    """Top AI-news articles, each with a 2-3 sentence summary of the
+    """Top AI-news articles, each with a 2-sentence summary of the
     article itself (worker role's model), plus its source and publish
-    date and time. Primary source is Bing News RSS (real articles);
-    web search results (section pages) top up the remaining slots,
-    because the news feed is thin once stock junk and dateless pages
-    are filtered out. Never raises: a
-    failure becomes an "error" note for the section. The returned
-    items carry "summary", "source", "date" and "time" keys; the
-    top-level "summary" is kept (empty) for callers that read it. No
-    raw search text is ever shown as a summary."""
+    date and time. Sources are the fixed trusted feeds in NEWS_FEEDS:
+    the newest items of each feed first (top 2 per feed), then the
+    rest if slots remain. A failed feed is skipped; an unfetchable
+    article is dropped and replaced. Never raises: a failure becomes
+    an "error" note for the section. The returned items carry
+    "summary", "source", "date" and "time" keys; the top-level
+    "summary" is kept (empty) for callers that read it. No raw search
+    text is ever shown as a summary — and no search engine is used
+    at all for this section."""
     if search_mod is None:
         return {"available": False, "count": 0, "items": [],
                 "summary": "",
                 "error": "search worker not deployed"}
-    kept = []
-    try:
-        articles = search_mod.search_news(NEWS_QUERY,
-                                          max_results=NEWS_SEARCH_RESULTS)
-    except Exception:
-        articles = []
-    if articles:
-        kept = _keep_items(search_mod, articles, require_date=True)
-    if len(kept) < NEWS_MAX_RESULTS:
-        # Top up with web search (section pages): the news feed is
-        # thin once stock junk and dateless pages are filtered out, so
-        # a digest of one article is worse than real articles first
-        # plus good section summaries. Same filters apply; domains
-        # already kept are skipped.
+    primary, secondary = [], []
+    for name, feed_url in NEWS_FEEDS:
         try:
-            pages = search_mod.search(WEB_NEWS_QUERY,
-                                      max_results=NEWS_SEARCH_RESULTS)
-        except Exception as e:
-            if kept:
-                pages = []
-            else:
-                return {"available": False, "count": 0, "items": [],
-                        "summary": "",
-                        "error": f"AI news unavailable today (search failed: {type(e).__name__})"}
+            items = search_mod.fetch_rss_feed(feed_url,
+                                              max_items=FEED_MAX_ITEMS)
+        except Exception:
+            continue
+        for i, item in enumerate(items):
+            item["feed"] = name
+            (primary if i < 2 else secondary).append(item)
+    kept = _keep_items(search_mod, primary,
+                       require_date=True, ai_filter=True,
+                       max_age_hours=24)
+    if len(kept) < NEWS_MAX_RESULTS:
+        # Fill the remaining slots with slightly older stories (up to
+        # 7 days) rather than sending a thin digest on a slow day.
         seen = {_domain(i.get("url") or "") for i in kept}
-        for item in _keep_items(search_mod, pages):
+        for item in _keep_items(search_mod, secondary,
+                               require_date=True, ai_filter=True,
+                               max_age_hours=24 * 7):
             if len(kept) >= NEWS_MAX_RESULTS:
                 break
             if _domain(item.get("url") or "") in seen:
@@ -493,7 +596,7 @@ def fetch_news(search_mod) -> dict:
     if not kept:
         return {"available": False, "count": 0, "items": [],
                 "summary": "",
-                "error": "AI news unavailable today (no news article could be read)"}
+                "error": "AI news unavailable today (no trusted feed could be read)"}
     return {"available": True, "count": len(kept), "items": kept,
             "summary": "", "error": None}
 
@@ -542,6 +645,19 @@ def build_digest() -> dict:
     }
     data = {"date": date, "sections": sections}
     data["text"] = format_digest(data)
+    # One Telegram message, not two: the cap is 4096 chars, and the
+    # bot splits anything longer. Shed the least important parts
+    # first (plans, then the oldest news items) until it fits.
+    while len(data["text"]) > TG_CHUNK_LIMIT - 100 and (
+            plans_data["items"] or len(news["items"]) > 3):
+        if plans_data["items"]:
+            plans_data["items"] = []
+            plans_data["links"] = {}
+            plans_data["note"] = None
+        elif len(news["items"]) > 3:
+            news["items"] = news["items"][:-1]
+            news["count"] = len(news["items"])
+        data["text"] = format_digest(data)
     return data
 
 
@@ -672,11 +788,17 @@ def send_digest() -> dict:
         return {"sent": False, "chats": 0, "chunks": 0, "data": data,
                 "error": "no Telegram chats known yet — the bot has not seen any chat"}
     chunks = split_message(data["text"])
+    # Pictures: Telegram shows a preview card (with the article's
+    # image) for one link per message. Point it at the top story so
+    # the single digest message carries an image.
+    news_items = data.get("sections", {}).get("news", {}).get("items") or []
+    preview_url = news_items[0].get("url") if news_items else None
     sent_any = False
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         chunk_sent = False
         for chat_id in chat_ids:
-            if send_telegram(chat_id, chunk, raw_html=True):
+            if send_telegram(chat_id, chunk, raw_html=True,
+                             preview_url=preview_url if i == 0 else None):
                 chunk_sent = True
         sent_any = sent_any or chunk_sent
     if not sent_any:
