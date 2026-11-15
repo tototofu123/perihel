@@ -378,18 +378,27 @@ def summarise(text: str, query: str | None = None,
     text = (text or "").strip()
     if not text:
         return ""
+    use_model = model or SEARCH_MODEL or None
+    user = "Summarise this text"
+    if query:
+        user += f" for the question: {query}"
+    user += f":\n\n{text[:SUMMARY_INPUT_CHARS]}"
+    messages = [{"role": "system", "content": system or SUMMARY_SYSTEM},
+                {"role": "user", "content": user}]
     try:
         from ai import nim_call_fallback  # lazy: keeps this module
         # importable without nim.key (only summarisation needs the key)
-        use_model = model or SEARCH_MODEL or None
-        user = "Summarise this text"
-        if query:
-            user += f" for the question: {query}"
-        user += f":\n\n{text[:SUMMARY_INPUT_CHARS]}"
-        resp, _used = nim_call_fallback(
-            [{"role": "system", "content": system or SUMMARY_SYSTEM},
-             {"role": "user", "content": user}],
-            timeout=30, model=use_model, role="worker")
+        resp, _used = nim_call_fallback(messages, timeout=30,
+                                        model=use_model, role="worker")
+        return resp["choices"][0]["message"]["content"].strip()
+    except Exception:
+        pass
+    # NIM chain down: try Gemini (Google AI Studio free tier) with the
+    # same messages before giving up. No gemini.key on the VM just
+    # means this step is skipped, same as before.
+    try:
+        from ai import gemini_call  # lazy, same reason as above
+        resp = gemini_call(messages, timeout=30)
         return resp["choices"][0]["message"]["content"].strip()
     except Exception:
         return ""

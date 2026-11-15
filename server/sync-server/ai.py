@@ -369,6 +369,89 @@ JSON_INSTRUCTION = ("Reply with ONLY minified JSON, no prose: "
                     '"memories": [{"key": str, "value": str}] or []}}')
 
 
+# ---------------- Gemini fallback (Google AI Studio, free tier) --------
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_MODEL = os.environ.get("PERIHEL_GEMINI_MODEL", "gemini-3.6-flash")
+# gemini-3.6-flash is the newest Flash model verified working on the
+# free-tier key (2026-11-16 00:00); 3.8-flash 503s/timeouts, 2.5-pro
+# and 2.5-flash-lite 404. Free tier is 20 requests/day per project
+# for the Flash models, 500/day for Flash-Lite — the digest runs once
+# a day and summarises at most 5 items, so a Gemini fallback costs at
+# most 5 calls and only on days the whole NIM chain is down.
+
+
+def _gemini_key() -> str:
+    """The Google AI Studio key, read from gemini.key in DATA_DIR
+    (root 600, same pattern as nim.key and github.key). Raises
+    RuntimeError when the file is missing, so callers can treat
+    'no Gemini configured' as a normal skip, not a crash."""
+    key = _read_key_file("gemini.key")
+    if key:
+        return key
+    raise RuntimeError(
+        f"no Gemini key found (looked for gemini.key in {DATA_DIR}); "
+        "create one at aistudio.google.com")
+
+
+def _gemini_payload(messages: list[dict]) -> dict:
+    """OpenAI-style messages -> Gemini generateContent body. System
+    becomes systemInstruction; user/assistant become contents with
+    roles user/model."""
+    system = None
+    contents = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content") or ""
+        if isinstance(content, list):  # vision-style parts: text only
+            content = " ".join(
+                p.get("text", "") for p in content if p.get("type") == "text")
+        if role == "system":
+            system = content
+        elif role == "assistant":
+            contents.append({"role": "model",
+                             "parts": [{"text": content}]})
+        else:
+            contents.append({"role": "user",
+                             "parts": [{"text": content}]})
+    body = {"contents": contents,
+            "generationConfig": {"temperature": 0.3,
+                                 "maxOutputTokens": 450}}
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+    return body
+
+
+def gemini_call(messages, model=None, timeout=30) -> dict:
+    """One Gemini generateContent call. Returns a NIM-shaped dict
+    ({"choices": [{"message": {"content": text}}]}) so callers work
+    unchanged. Raises on any failure (missing key, HTTP error,
+    timeout, empty reply) — the caller decides what to do next.
+    The key travels in the query string (Google's documented
+    placement) and is never logged."""
+    use_model = model or GEMINI_MODEL
+    body = json.dumps(_gemini_payload(messages)).encode()
+    url = (f"{GEMINI_URL}/models/{use_model}:generateContent"
+           f"?key={urllib.parse.quote(_gemini_key(), safe='')}")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise urllib.error.HTTPError(
+            url.split("?")[0], e.code, e.reason, e.headers,
+            io.BytesIO(e.read()))
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"Gemini reply had no text: {str(data)[:120]}")
+    if not (text or "").strip():
+        raise RuntimeError("Gemini reply was empty")
+    print(f"Gemini call: model={use_model} chars={len(text)}", flush=True)
+    return {"choices": [{"message": {"content": text.strip()}}]}
+
+
 def _json_turn(raw_content: str, system_msg: dict, model=None, role=None):
     """Strict-JSON completion (no tools). Returns (summary, category,
     reminders, memories) or (None,...) on failure. A call that returns
