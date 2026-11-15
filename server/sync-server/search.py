@@ -164,7 +164,8 @@ def _search_bing_rss(query: str, max_results: int) -> list[dict]:
             continue
         out.append({"title": _clean(item.findtext("title")),
                     "url": link,
-                    "snippet": _clean(item.findtext("description"))})
+                    "snippet": _clean(item.findtext("description")),
+                    "pub_date": _clean(item.findtext("pubDate"))})
         if len(out) >= max_results:
             break
     return out
@@ -213,10 +214,11 @@ def _search_bing_html(query: str, max_results: int) -> list[dict]:
 
 
 def search(query: str, max_results: int = 5) -> list[dict]:
-    """Web search. Returns [{title, url, snippet}]. RSS first; HTML only
-    when RSS fails or returns nothing. Raises only when both providers
-    fail (network / HTTP error) — the endpoint turns that into a 502.
-    An empty list means the search worked and found nothing."""
+    """Web search. Returns [{title, url, snippet, pub_date}]. RSS first;
+    HTML only when RSS fails or returns nothing (HTML items carry no
+    pub_date). Raises only when both providers fail (network / HTTP
+    error) — the endpoint turns that into a 502. An empty list means
+    the search worked and found nothing."""
     query = (query or "").strip()
     if not query:
         raise ValueError("empty query")
@@ -261,11 +263,13 @@ SUMMARY_SYSTEM = ("You summarise web text. Reply with a short, factual "
                   "summary (3-6 sentences, no preamble, no invented "
                   "details).")
 
-ITEM_SYSTEM = ("You summarise one news page. Reply with 1-2 sentences "
-               "about the top story (or top 2-3 stories, if the page "
-               "lists several): what happened, in plain words. No "
-               "preamble, no invented details, no repeating the page's "
-               "own description of itself.")
+ITEM_SYSTEM = ("You summarise one news page. Reply with 2-3 sentences "
+               "TOTAL, one sentence per story, covering the top 2-3 "
+               "stories on it: what happened, who is involved, and why "
+               "it matters, in plain words with enough detail to be "
+               "useful. Keep it tight — the whole reply must fit in "
+               "2-3 sentences. No preamble, no invented details, no "
+               "repeating the page's own description of itself.")
 
 
 def summarise(text: str, query: str | None = None,
