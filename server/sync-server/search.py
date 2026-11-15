@@ -171,6 +171,58 @@ def _search_bing_rss(query: str, max_results: int) -> list[dict]:
     return out
 
 
+def _decode_bing_news_link(href: str) -> str:
+    """Bing News RSS wraps destinations in apiclick.aspx links with the
+    real URL in the `url` query param (percent-encoded). Decode it;
+    keep the original link when there is nothing to decode — it still
+    works in a browser (Bing redirects). Pure."""
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+        real = qs.get("url", [None])[0]
+        if real:
+            return urllib.parse.unquote(real)
+    except Exception:
+        pass
+    return href
+
+
+def _search_bing_news_rss(query: str, max_results: int) -> list[dict]:
+    """Bing News RSS: real news *articles* (not section homepages),
+    each with a title, destination link, description and pubDate.
+    Raises on HTTP / network / parse failure; returns [] only when
+    Bing genuinely has no items for the query."""
+    params = urllib.parse.urlencode(
+        {"q": query, "format": "rss", "count": max_results})
+    req = urllib.request.Request(
+        f"https://www.bing.com/news/search?{params}",
+        headers={"User-Agent": BROWSER_UA})
+    with urllib.request.urlopen(req, timeout=SEARCH_TIMEOUT_S) as resp:
+        tree = ET.fromstring(resp.read())
+    out = []
+    for item in tree.iter("item"):
+        link = _decode_bing_news_link(_clean(item.findtext("link")))
+        if not link:
+            continue
+        out.append({"title": _clean(item.findtext("title")),
+                    "url": link,
+                    "snippet": _clean(item.findtext("description")),
+                    "pub_date": _clean(item.findtext("pubDate"))})
+        if len(out) >= max_results:
+            break
+    return out
+
+
+def search_news(query: str, max_results: int = 5) -> list[dict]:
+    """News search: real articles via Bing News RSS. Returns
+    [{title, url, snippet, pub_date}]; [] when the feed fails or has
+    nothing (never raises — the digest treats that as an unavailable
+    section and falls back to web search)."""
+    try:
+        return _search_bing_news_rss(query, max_results)
+    except Exception:
+        return []
+
+
 def _resolve_bing_link(href: str) -> str:
     """Bing HTML wraps destinations in /ck/a redirect links. Follow the
     redirect (headers only, short timeout) to get the real URL; keep the
@@ -263,13 +315,14 @@ SUMMARY_SYSTEM = ("You summarise web text. Reply with a short, factual "
                   "summary (3-6 sentences, no preamble, no invented "
                   "details).")
 
-ITEM_SYSTEM = ("You summarise one news page. Reply with 2-3 sentences "
-               "TOTAL, one sentence per story, covering the top 2-3 "
-               "stories on it: what happened, who is involved, and why "
-               "it matters, in plain words with enough detail to be "
-               "useful. Keep it tight — the whole reply must fit in "
-               "2-3 sentences. No preamble, no invented details, no "
-               "repeating the page's own description of itself.")
+ITEM_SYSTEM = ("You summarise one news article. Reply with 2-3 "
+               "sentences TOTAL, in your own words: what happened, who "
+               "is involved, and why it matters, with enough context "
+               "that a reader who never opens the article understands "
+               "the story. Do NOT copy sentences from the article — "
+               "write a real summary. No preamble, no invented "
+               "details, no repeating the site's own description of "
+               "itself.")
 
 
 def summarise(text: str, query: str | None = None,

@@ -13,18 +13,17 @@ VM itself; the bus scheduler stays the mechanism for scheduled jobs
 generally, but it cannot trigger this one.
 
 Sections — defaults, each configurable (see below):
-  - AI news: the search worker (search.py) for "artificial intelligence
-    news", top 5 usable results (8 fetched, so a page that cannot be
-    fetched is replaced, not shown as a bare link). Each result page
-    is fetched and summarised to 2-3 sentences by the worker role's
-    model, so the section says what actually happened — never a dump
-    of titles/URLs/snippets (that was the 2026-11-15 bug: summarise()
-    failed on the retired default model and returned raw text as the
-    "summary"). Every item carries a subheading with its source and
-    publish date next to the link. A failed item summary falls back
-    to that item's snippet; an unfetchable page is dropped entirely
-    (Reuters blocks fetches, so it no longer shows up as a bare
-    site description).
+  - AI news: real news *articles* via the search worker's Bing News
+    RSS (search_news), top 5 usable. Each article is fetched and
+    summarised to 2-3 sentences by the worker role's model — a real
+    summary of one story, not cropped fragments off a section
+    homepage (that was the 2026-11-15 bug: homepages are a jumble of
+    headlines, so the model just lifted sentences off the page).
+    Market/stock-tip junk is filtered out, and an unfetchable article
+    is dropped and replaced. Every item carries a subheading with its
+    source and publish date AND time (HKT) next to the link. When the
+    news feed yields nothing usable, the section falls back to web
+    search results (section pages) rather than coming up empty.
   - Repos: open PRs and open issues (most recently updated first, max 5
     each) for PERIHEL_DIGEST_REPOS (comma-separated owner/repo;
     default agent-bus, perihel-v2, hkust-climbing-app), via the GitHub
@@ -56,8 +55,11 @@ PLANS_PATH = os.path.join(DATA_DIR, "plans.md")
 
 DEFAULT_REPOS = ["tototofu123/agent-bus", "tototofu123/perihel-v2",
                  "HKUST-Climbing-Society/hkust-climbing-app"]
-NEWS_QUERY = "artificial intelligence news"
+NEWS_QUERY = "artificial intelligence"  # Bing News RSS query
+WEB_NEWS_QUERY = "artificial intelligence news"  # web-search fallback
 NEWS_MAX_RESULTS = 5
+NEWS_SEARCH_RESULTS = 16  # news articles fetched; the first usable 5
+                          # are kept after junk filtering
 REPO_MAX_ITEMS = 5        # per repo, per kind (PRs / issues)
 PLANS_MAX_LINES = 10
 GITHUB_TIMEOUT_S = 15
@@ -233,10 +235,7 @@ def get_search_module():
         return None
 
 
-ITEM_FETCH_CHARS = 6000  # chars of each news page sent to the model
-NEWS_SEARCH_RESULTS = 8   # fetched; the first NEWS_MAX_RESULTS usable
-                          # ones are kept, so an unfetchable page is
-                          # replaced instead of shown as a bare link
+ITEM_FETCH_CHARS = 6000  # chars of each news article sent to the model
 
 
 def _domain(url: str) -> str:
@@ -262,6 +261,9 @@ _SOURCE_NAMES = {
     "bbc.com": "BBC",
     "nytimes.com": "NY Times",
     "pcmag.com": "PCMag",
+    "nsf.gov": "NSF",
+    "msn.com": "MSN",
+    "whitehouse.gov": "White House",
 }
 
 # A "summary" that is just the site describing itself, not news
@@ -276,6 +278,15 @@ _GENERIC_PHRASES = (
     "most recent coverage",
     "find the latest",
     "news and insights surrounding",
+    # Model refusals (the fetched page had almost no text, e.g. a
+    # portal that blocks scraping): "You haven't provided an article
+    # to summarize — paste the article text..."
+    "you haven't provided",
+    "paste the article",
+    "cannot summarize",
+    "no article to summarize",
+    "as an ai language model",
+    "i don't have access to",
 )
 
 
@@ -299,16 +310,17 @@ def _source_name(url: str) -> str:
     return base.replace("-", " ").replace("_", " ").title() or "Web"
 
 
-def _format_date(pub_date: str | None) -> str:
-    """An RSS pubDate ('Sat, 15 Nov 2026 08:00:00 GMT') -> '15 Nov
-    2026'. '' when there is no usable date — including a stale one:
-    section homepages sometimes carry an old cached date (ScienceDaily
-    once showed 2024), and a wrong date is worse than none. Dates more
-    than 14 days old, or in the future, are dropped. Pure."""
+def _format_datetime(pub_date: str | None) -> tuple[str, str]:
+    """An RSS pubDate ('Sat, 15 Nov 2026 08:00:00 GMT') -> ('15 Nov
+    2026', '16:00') in VM-local time (HKT). ('', '') when there is no
+    usable date — including a stale one: section homepages sometimes
+    carry an old cached date (ScienceDaily once showed 2024), and a
+    wrong date is worse than none. Dates more than 14 days old, or in
+    the future, are dropped. Pure."""
     if not pub_date:
-        return ""
+        return "", ""
     try:
-        from datetime import datetime, timezone
+        from datetime import timezone
         from email.utils import parsedate_to_datetime
         dt = parsedate_to_datetime(pub_date.strip())
         if dt.tzinfo is None:
@@ -316,10 +328,28 @@ def _format_date(pub_date: str | None) -> str:
         now = datetime.now(timezone.utc)
         age_days = (now - dt).total_seconds() / 86400
         if age_days < -1 or age_days > 14:
-            return ""
-        return dt.strftime("%d %b %Y")
+            return "", ""
+        local = dt.astimezone()  # VM local time (set it to HKT)
+        return local.strftime("%d %b %Y"), local.strftime("%H:%M")
     except Exception:
-        return ""
+        return "", ""
+
+
+# Titles/descriptions that mark stock-market content, not tech news.
+# Bing News is full of it for AI queries ("Which AI Stock Is a Better
+# Buy", "AI Stocks Under $10"). Such items are filtered out before
+# fetching, so the digest is news, not investing tips.
+_MARKET_WORDS = (
+    "stock", "stocks", "stock market", "s&p", "nasdaq", "dow jones",
+    "shares", "dividend", "better buy", "biggest win", "under $10",
+    "rally", "market today", "market news",
+)
+
+
+def _is_market_junk(item: dict) -> bool:
+    """True when a news item is stock-market content. Pure."""
+    text = f"{item.get('title') or ''} {item.get('snippet') or ''}".lower()
+    return any(word in text for word in _MARKET_WORDS)
 
 
 def _ends_cleanly(text: str) -> bool:
@@ -362,7 +392,9 @@ def _summarise_item(search_mod, item: dict) -> str:
         page_text = search_mod.fetch(url, max_chars=ITEM_FETCH_CHARS)
     except Exception:
         return ""
-    if not (page_text or "").strip():
+    if len((page_text or "").strip()) < 300:
+        # Almost no readable text (portal / blocked page): there is
+        # nothing to summarise, and the model just refuses. Drop it.
         return ""
     summary = (search_mod.summarise(page_text,
                                     system=search_mod.ITEM_SYSTEM) or "").strip()
@@ -378,36 +410,27 @@ def _summarise_item(search_mod, item: dict) -> str:
     return snippet
 
 
-def fetch_news(search_mod) -> dict:
-    """Top AI-news results, each with a 2-3 sentence summary of its
-    page (worker role's model), plus its source and publish date.
-    Fetches more results than it shows so an unfetchable page (or a
-    second page from the same site) is replaced, not shown. Never
-    raises: a failure becomes an "error" note for the section. The
-    returned items carry "summary", "source" and "date" keys; the
-    top-level "summary" is kept (empty) for callers that read it. No
-    raw search text is ever shown as a summary."""
-    if search_mod is None:
-        return {"available": False, "count": 0, "items": [],
-                "summary": "",
-                "error": "search worker not deployed"}
-    try:
-        items = search_mod.search(NEWS_QUERY, max_results=NEWS_SEARCH_RESULTS)
-    except Exception as e:
-        return {"available": False, "count": 0, "items": [],
-                "summary": "",
-                "error": f"AI news unavailable today (search failed: {type(e).__name__})"}
-    if not items:
-        return {"available": False, "count": 0, "items": [],
-                "summary": "",
-                "error": "AI news unavailable today (no results)"}
+def _keep_items(search_mod, items: list[dict],
+                require_date: bool = False) -> list[dict]:
+    """Summarise a list of candidate items, keeping the first
+    NEWS_MAX_RESULTS usable ones: one per domain, not market junk, a
+    real (non-generic, finished) summary. With require_date (the news
+    feed), an item with no fresh publish date is skipped too — a news
+    article with no date is usually an evergreen/landing page, not
+    news. Pure except for the fetches and NIM calls inside
+    _summarise_item."""
     kept = []
     seen_domains = set()
     for item in items:
         if len(kept) >= NEWS_MAX_RESULTS:
             break
+        if _is_market_junk(item):
+            continue
         domain = _domain(item.get("url") or "")
         if domain and domain in seen_domains:
+            continue
+        date, time = _format_datetime(item.get("pub_date"))
+        if require_date and not date:
             continue
         summary = _summarise_item(search_mod, item)
         if not summary or _looks_generic(summary):
@@ -416,12 +439,61 @@ def fetch_news(search_mod) -> dict:
             seen_domains.add(domain)
         item["summary"] = summary
         item["source"] = _source_name(item.get("url") or "")
-        item["date"] = _format_date(item.get("pub_date"))
+        item["date"], item["time"] = date, time
         kept.append(item)
+    return kept
+
+
+def fetch_news(search_mod) -> dict:
+    """Top AI-news articles, each with a 2-3 sentence summary of the
+    article itself (worker role's model), plus its source and publish
+    date and time. Primary source is Bing News RSS (real articles);
+    web search results (section pages) top up the remaining slots,
+    because the news feed is thin once stock junk and dateless pages
+    are filtered out. Never raises: a
+    failure becomes an "error" note for the section. The returned
+    items carry "summary", "source", "date" and "time" keys; the
+    top-level "summary" is kept (empty) for callers that read it. No
+    raw search text is ever shown as a summary."""
+    if search_mod is None:
+        return {"available": False, "count": 0, "items": [],
+                "summary": "",
+                "error": "search worker not deployed"}
+    kept = []
+    try:
+        articles = search_mod.search_news(NEWS_QUERY,
+                                          max_results=NEWS_SEARCH_RESULTS)
+    except Exception:
+        articles = []
+    if articles:
+        kept = _keep_items(search_mod, articles, require_date=True)
+    if len(kept) < NEWS_MAX_RESULTS:
+        # Top up with web search (section pages): the news feed is
+        # thin once stock junk and dateless pages are filtered out, so
+        # a digest of one article is worse than real articles first
+        # plus good section summaries. Same filters apply; domains
+        # already kept are skipped.
+        try:
+            pages = search_mod.search(WEB_NEWS_QUERY,
+                                      max_results=NEWS_SEARCH_RESULTS)
+        except Exception as e:
+            if kept:
+                pages = []
+            else:
+                return {"available": False, "count": 0, "items": [],
+                        "summary": "",
+                        "error": f"AI news unavailable today (search failed: {type(e).__name__})"}
+        seen = {_domain(i.get("url") or "") for i in kept}
+        for item in _keep_items(search_mod, pages):
+            if len(kept) >= NEWS_MAX_RESULTS:
+                break
+            if _domain(item.get("url") or "") in seen:
+                continue
+            kept.append(item)
     if not kept:
         return {"available": False, "count": 0, "items": [],
                 "summary": "",
-                "error": "AI news unavailable today (no news page could be read)"}
+                "error": "AI news unavailable today (no news article could be read)"}
     return {"available": True, "count": len(kept), "items": kept,
             "summary": "", "error": None}
 
@@ -497,9 +569,12 @@ def format_digest(data: dict) -> str:
         for item in news["items"]:
             source = _esc(item.get("source") or "Web")
             date = _esc(item.get("date") or "")
+            time = _esc(item.get("time") or "")
             subhead = f"🗞️ <b>{source}</b>"
             if date:
                 subhead += f"  ·  📅 {date}"
+            if time:
+                subhead += f"  ·  🕐 {time}"
             lines.append(subhead)
             lines.append(f"• {_link(item['url'], item['title'])}")
             if item.get("summary"):
