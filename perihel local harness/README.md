@@ -69,6 +69,11 @@ past the header. Long input now scrolls horizontally with a `<` marker instead
 of wrapping into the status bar. `cargo test` covers the invariants (no rendered
 row wider than the window, no frame taller than the window).
 
+**PgUp / PgDn** scroll the conversation (new output snaps back to the bottom);
+the status bar shows `SCROLLED +N` while you are reading older messages.
+`--tui` is the default and is still accepted as a flag for the README and
+desktop shortcut.
+
 ## How tool calling works
 
 llama.cpp has no native tool-call API, so `tools.gbnf` is embedded in the binary
