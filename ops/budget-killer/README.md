@@ -34,7 +34,7 @@ from there.
   daily.
 
 **It also creates itself.** `tick.py` runs once a minute on the VM, and
-`server/sync-server/budget_fallback.py` checks once a day whether the
+`vm/budget_fallback.py` checks once a day whether the
 metric descriptor exists; the first day after billable usage starts it
 creates the policy through the VM's service account (metadata token,
 no secret) and pushes a notification. So the fallback becomes live

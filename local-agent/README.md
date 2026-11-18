@@ -1,4 +1,4 @@
-# Perihel desktop
+# Perihel local agent
 
 The Rust workspace: `perihel` (app), `perihel-transcribe` (dictation),
 `perihel-core` (db, sync, settings, dictionary, resource guard).
