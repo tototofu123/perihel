@@ -45,8 +45,10 @@ thinking off. Every generation prints `[stats] N tokens in X.Xs = Y.Y tok/s`
 The llama.cpp server here runs with `--parallel 1`, so a long generation blocks
 later requests. Keep thinking off for interactive use.
 
-Typing `/` in the TUI opens a live **command suggestion** popup (Tab completes,
-Enter runs). `/session` opens a session browser with a `>` pointer over saved
+Typing `/` in the TUI opens a live **command menu**. Up/Down (or `j`/`k`) move
+the `>` pointer, **Tab** completes the highlighted command, and **Enter** runs
+it (opencode/oh-my-pi style). Typing filters the list; the menu resets when the
+text changes. `/session` opens a session browser with a `>` pointer over saved
 conversations (`~/.perihel/sessions/`); Enter restores one, and `/session <n>`
 does the same from the CLI. Every turn is saved automatically.
 

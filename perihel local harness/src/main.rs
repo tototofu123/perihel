@@ -53,6 +53,18 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/quit", "exit perihel"),
 ];
 
+/// Commands matching what the user has typed so far. An empty query matches all.
+fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
+    let q = input.trim_start();
+    if !q.starts_with('/') { return Vec::new(); }
+    COMMANDS.iter().filter(|(name, _)| name.starts_with(q)).take(6).copied().collect()
+}
+
+/// The bare command word, without the argument hint (`/model [name]` -> `/model`).
+fn command_word(name: &str) -> &str {
+    name.split(' ').next().unwrap_or(name)
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "perihel", version = "0.1.0",
           about = "Local tool-calling agent harness (llama.cpp + GBNF)")]
@@ -667,6 +679,8 @@ struct App {
     busy: bool,
     /// Lines scrolled up from the bottom of the conversation.
     scroll: usize,
+    /// Highlighted row in the slash-command menu.
+    suggest_cursor: usize,
 }
 
 impl App {
@@ -792,10 +806,8 @@ impl App {
     /// unit-tested at a fixed size.
     fn frame_with_size(&self, input: &str, cursor: usize, cols: usize, rows: usize) -> String {
         let q = input.trim_start();
-        let suggestions: Vec<(&str, &str)> = if q.starts_with('/') {
-            COMMANDS.iter().filter(|(name, _)| name.starts_with(q))
-                .take(6).copied().collect()
-        } else { Vec::new() };
+        let suggestions = command_matches(q);
+        let sel = self.suggest_cursor.min(suggestions.len().saturating_sub(1));
         let extra = if suggestions.is_empty() { 0 } else { suggestions.len() + 2 };
         // Reserve header, separators, status bar, input line and suggestions.
         let body_h = rows.saturating_sub(6 + extra).max(1);
@@ -836,12 +848,18 @@ impl App {
         }
         out.push_str(&format!("{}\n", "-".repeat(cols.saturating_sub(1))));
         if !suggestions.is_empty() {
-            out.push_str("\x1b[1m  commands\x1b[0m\n");
-            for (name, desc) in suggestions {
-                let row = format!("  {name}  {desc}");
-                out.push_str(&format!("{}\x1b[0K\n", clip_plain(&row, cols)));
+            out.push_str(&format!("{}\n", clip_ansi("\x1b[1m  commands\x1b[0m\x1b[2m   up/down select, tab complete, enter run\x1b[0m", cols)));
+            for (i, (name, desc)) in suggestions.iter().enumerate() {
+                let ptr = if i == sel { "\x1b[32m>\x1b[0m" } else { " " };
+                let label = if i == sel {
+                    format!("\x1b[1;36m{name}\x1b[0m")
+                } else {
+                    format!("\x1b[36m{name}\x1b[0m")
+                };
+                let row = format!("  {ptr} {label}  \x1b[2m{desc}\x1b[0m");
+                out.push_str(&format!("{}\x1b[0K\n", clip_ansi(&row, cols)));
             }
-            out.push_str("\x1b[2m  Tab completes, Enter runs\x1b[0m\x1b[0K\n");
+            out.push_str(&format!("{}\x1b[0K\n", clip_ansi("\x1b[2m  Tab completes, Enter runs\x1b[0m", cols)));
         }
         let cap = if self.max_rounds == 0 { "inf".into() } else { self.max_rounds.to_string() };
         // Keep the status bar to one row: drop optional pieces on narrow terminals.
@@ -1030,6 +1048,32 @@ fn clip_plain(s: &str, cols: usize) -> String {
     out
 }
 
+/// Clip text that contains ANSI escapes, keeping the escapes intact.
+fn clip_ansi(s: &str, cols: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\x1b' {
+            out.push(c);
+            if it.peek() == Some(&'[') {
+                out.push(it.next().unwrap_or('['));
+                for d in it.by_ref() {
+                    out.push(d);
+                    if ('\x40'..='\x7e').contains(&d) { break; }
+                }
+            }
+            continue;
+        }
+        let cw = char_width(c);
+        if w + cw > cols { break; }
+        out.push(c);
+        w += cw;
+    }
+    out.push_str("\x1b[0m");
+    out
+}
+
 fn banner(app: &App) {
     if app.tui { return; }
     println!("perihel 0.1.0 | model={} | rounds={} | grammar={} | workspace={}",
@@ -1083,6 +1127,7 @@ fn main() {
         session_id: format!("session-{}", chrono_stamp()),
         busy: false,
         scroll: 0,
+        suggest_cursor: 0,
     };
 
     if app.tui {
@@ -1170,29 +1215,39 @@ fn main() {
                 // Full-screen line editor with a visible block cursor.
                 let mut buf = String::new();
                 let mut cursor = 0usize;
+                app.suggest_cursor = 0;
                 loop {
                     app.draw_cursor(&buf, cursor);
                     match read_key() {
                         Key::Char('c', true) => break 'outer,
-                        Key::Char('\t', false) if buf.trim_start().starts_with('/') => {
-                            if let Some((name, _)) = COMMANDS.iter()
-                                .find(|(name, _)| name.starts_with(buf.trim_start()))
-                            {
-                                buf.clear();
-                                buf.push_str(name);
-                                buf.push(' ');
+                        Key::Down => {
+                            let n = command_matches(&buf).len().saturating_sub(1);
+                            app.suggest_cursor = (app.suggest_cursor + 1).min(n);
+                        }
+                        Key::Up => {
+                            app.suggest_cursor = app.suggest_cursor.saturating_sub(1);
+                        }
+                        Key::Char('\t', false) => {
+                            let matches = command_matches(&buf);
+                            if let Some((name, _)) = matches.get(app.suggest_cursor.min(matches.len().saturating_sub(1))) {
+                                buf = format!("{} ", command_word(name));
                                 cursor = buf.len();
                             }
                         }
                         Key::Char(ch, false) => {
                             buf.insert(cursor, ch);
                             cursor += ch.len_utf8();
+                            app.suggest_cursor = 0;
                         }
                         Key::Backspace if cursor > 0 => {
                             cursor = prev_boundary(&buf, cursor);
                             buf.remove(cursor);
+                            app.suggest_cursor = 0;
                         }
-                        Key::Delete if cursor < buf.len() => { buf.remove(cursor); }
+                        Key::Delete if cursor < buf.len() => {
+                            buf.remove(cursor);
+                            app.suggest_cursor = 0;
+                        }
                         Key::Left => cursor = prev_boundary(&buf, cursor),
                         Key::Right => cursor = next_boundary(&buf, cursor),
                         Key::Home => cursor = 0,
@@ -1207,8 +1262,16 @@ fn main() {
                             let step = rows.saturating_sub(8).max(1);
                             app.scroll = app.scroll.saturating_sub(step);
                         }
-                        Key::Enter => break,
-                        Key::Esc => { buf.clear(); cursor = 0; }
+                        Key::Enter => {
+                            // Enter runs the highlighted command (like opencode/omp).
+                            let matches = command_matches(&buf);
+                            if !matches.is_empty() {
+                                let i = app.suggest_cursor.min(matches.len() - 1);
+                                buf = command_word(matches[i].0).to_string();
+                            }
+                            break;
+                        }
+                        Key::Esc => { buf.clear(); cursor = 0; app.suggest_cursor = 0; }
                         _ => {}
                     }
                 }
@@ -1345,6 +1408,7 @@ mod layout_tests {
             session_id: "t".to_string(),
             busy: false,
             scroll: 0,
+            suggest_cursor: 0,
         };
         for (cols, rows) in [(30usize, 10usize), (40, 12), (64, 24), (120, 40)] {
             let frame = app.frame_with_size("/mo", 3, cols, rows);
@@ -1376,6 +1440,7 @@ mod layout_tests {
             session_id: "t".to_string(),
             busy: false,
             scroll: 0,
+            suggest_cursor: 0,
         };
         let frame = app.frame_with_size("", 0, 64, 24);
         let line = frame.lines().find(|l| l.contains("hello there"))
@@ -1406,6 +1471,7 @@ mod layout_tests {
             session_id: "t".to_string(),
             busy: false,
             scroll: 0,
+            suggest_cursor: 0,
         };
         let newest = app.frame_with_size("", 0, 64, 24);
         assert!(newest.contains("line 39"), "newest view should show the last line");
@@ -1415,6 +1481,39 @@ mod layout_tests {
         let oldest = app.frame_with_size("", 0, 64, 24);
         assert!(oldest.contains("line 0"), "scrolled view should reach the first line");
         assert!(oldest.contains("SCROLLED"));
+    }
+
+    #[test]
+    fn slash_menu_has_a_movable_pointer() {
+        let mut app = App {
+            client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            root: PathBuf::from("."),
+            max_rounds: 0,
+            tui: true,
+            round: 0,
+            history: vec![],
+            picking_model: false,
+            model_list: vec![],
+            model_cursor: 0,
+            picking_session: false,
+            session_list: vec![],
+            session_cursor: 0,
+            session_id: "t".to_string(),
+            busy: false,
+            scroll: 0,
+            suggest_cursor: 2,
+        };
+        let frame = app.frame_with_size("/", 1, 64, 24);
+        let selected = frame.lines().find(|l| l.contains("/session")).expect("/session row");
+        assert!(selected.contains("\x1b[32m>"), "selected row needs the pointer: {selected:?}");
+        let other = frame.lines().find(|l| l.contains("/help")).expect("/help row");
+        assert!(!other.contains("\x1b[32m>"), "unselected row must not have the pointer");
+
+        assert_eq!(command_word("/model [name]"), "/model");
+        assert_eq!(command_word("/thinking on|off"), "/thinking");
+        assert_eq!(command_matches("/mo").len(), 1);
+        assert_eq!(command_matches("/").len(), 6);
+        assert!(command_matches("hello").is_empty());
     }
 
     #[test]
