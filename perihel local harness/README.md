@@ -45,6 +45,11 @@ thinking off. Every generation prints `[stats] N tokens in X.Xs = Y.Y tok/s`
 The llama.cpp server here runs with `--parallel 1`, so a long generation blocks
 later requests. Keep thinking off for interactive use.
 
+Typing `/` in the TUI opens a live **command suggestion** popup (Tab completes,
+Enter runs). `/session` opens a session browser with a `>` pointer over saved
+conversations (`~/.perihel/sessions/`); Enter restores one, and `/session <n>`
+does the same from the CLI. Every turn is saved automatically.
+
 When no `--model` is given, the first available model is auto-selected instead
 of the `local-model` placeholder. llama.cpp reports the full GGUF path, so the
 display name is shortened to the file name. `/model` opens a **model picker**
@@ -67,25 +72,6 @@ Tools: `fs.list`, `fs.read`, `fs.write`, `fs.mkdir`, `fs.copy`, `run.cmd`,
 `run.test`, `reply.text`. All paths are workspace-sandboxed, commands are
 allowlisted with no shell, 60 s timeout, bounded output. `enable_thinking` is
 off to avoid the reasoning loops measured with Qwen3.5-4B.
-
-## TUI design (borrowed from oh-my-pi)
-
-- Full-screen line editor with a **visible block cursor**; Left/Right/Home/End
-  and Backspace/Delete work, so you can see where you are editing.
-- `/model` opens a **model picker** with a `>` pointer (arrows or j/k, number
-  to jump, Enter to select, q to cancel).
-- Tool calls render as compact grouped lines; long output is hard-wrapped with
-  leftovers erased so narrow/half-height windows do not smear text.
-- Footer shows model, workspace, round and last timings, plus a visible
-  `generating... (Ctrl+C stops)` line while busy.
-- Scrollback is preserved (home + erase-below rather than full clear).
-
-## Web tools (ported from the VM harness)
-
-- `web.search` — keyless Bing RSS search, top 8 results, 5 s gap + 10/min limit.
-- `web.fetch` — fetches an http(s) page (2 MB cap), strips script/style/nav and
-  collapses to readable text (6k chars). Mirrors `server/sync-server/search.py`
-  from the online VM, but local and GBNF-constrained.
 
 ## Desktop shortcuts
 

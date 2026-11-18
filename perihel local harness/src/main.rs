@@ -41,6 +41,18 @@ const TOOLS: &[&str] = &[
     "run.cmd", "run.test", "web.search", "web.fetch", "reply.text",
 ];
 
+const COMMANDS: &[(&str, &str)] = &[
+    ("/help", "show this help"),
+    ("/model [name]", "pick a model (no arg opens picker)"),
+    ("/session", "browse and restore past sessions"),
+    ("/thinking on|off", "toggle streamed reasoning"),
+    ("/rounds <n>", "set max tool rounds (0 = unlimited)"),
+    ("/tools", "list available tools"),
+    ("/workspace", "show the sandbox root"),
+    ("/reset", "clear the conversation"),
+    ("/quit", "exit perihel"),
+];
+
 #[derive(Parser, Debug)]
 #[command(name = "perihel", version = "0.1.0",
           about = "Local tool-calling agent harness (llama.cpp + GBNF)")]
@@ -321,6 +333,84 @@ fn run_process(argv: &[String], cwd: &Path) -> Result<(bool, String), String> {
     }
 }
 
+// ------------------------------------------------------------------ sessions
+
+fn sessions_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("PERIHEL_SESSIONS_DIR") { return PathBuf::from(p); }
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".perihel").join("sessions")
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SessionFile {
+    id: String,
+    title: String,
+    saved_at: String,
+    messages: Vec<Value>,
+}
+
+fn save_session(client: &Client) -> Option<(PathBuf, SessionFile)> {
+    if client.messages.len() <= 1 { return None; }
+    let dir = sessions_dir();
+    fs::create_dir_all(&dir).ok()?;
+    let first_user = client.messages.iter()
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+        .and_then(|m| m.get("content").and_then(|v| v.as_str()))
+        .unwrap_or("session");
+    let title = first_user.chars().take(48).collect::<String>()
+        + if first_user.chars().count() > 48 { "..." } else { "" };
+    let id = client.messages.iter()
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+        .and_then(|m| m.get("id").and_then(|v| v.as_str()))
+        .unwrap_or("current").to_string();
+    let file = SessionFile {
+        id: id.clone(), title,
+        saved_at: chrono_stamp(),
+        messages: client.messages.clone(),
+    };
+    let path = dir.join(format!("{}.json", sanitize_name(&id)));
+    fs::write(&path, serde_json::to_string_pretty(&file).ok()?).ok()?;
+    Some((path, file))
+}
+
+fn chrono_stamp() -> String {
+    // Seconds since epoch is enough for a readable "saved at" label.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    format!("{secs}")
+}
+
+fn sanitize_name(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(60).collect()
+}
+
+fn list_sessions() -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(sessions_dir()) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") { continue; }
+            if let Ok(text) = fs::read_to_string(&p) {
+                if let Ok(s) = serde_json::from_str::<SessionFile>(&text) {
+                    out.push((p, s.title));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.truncate(30);
+    out
+}
+
+fn load_session(client: &mut Client, path: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let file: SessionFile = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    client.messages = file.messages;
+    Ok(())
+}
+
 // ------------------------------------------------------------------ web tools
 
 #[derive(Default)]
@@ -566,12 +656,27 @@ struct App {
     picking_model: bool,
     model_list: Vec<String>,
     model_cursor: usize,
+    picking_session: bool,
+    session_list: Vec<(PathBuf, String)>,
+    session_cursor: usize,
+    session_id: String,
 }
 
 impl App {
     fn add(&mut self, kind: &str, text: &str) {
         self.history.push((kind.to_string(), text.to_string()));
         if self.tui { self.draw(""); }
+    }
+
+    fn save_current_session(&mut self) {
+        for m in &mut self.client.messages {
+            if m.get("role").and_then(|v| v.as_str()) == Some("user") && m.get("id").is_none() {
+                m["id"] = json!(self.session_id);
+            }
+        }
+        if let Some((path, _)) = save_session(&self.client) {
+            if !self.tui { println!("[session] saved {}", path.display()); }
+        }
     }
 
     /// Print a message that survives the full-screen redraw in TUI mode.
@@ -646,14 +751,39 @@ impl App {
         let _ = io::stdout().flush();
     }
 
+    fn draw_session_picker(&self) {
+        let (cols, _) = term_size();
+        let mut out = String::from("\x1b[H\x1b[2J");
+        out.push_str("\x1b[48;5;24m\x1b[97m SESSIONS \x1b[0m  recent conversations\x1b[0m\n");
+        out.push_str(&format!("{}\n", "-".repeat(cols)));
+        out.push_str("  arrows / j k : move   number : jump   Enter : restore   q : cancel\n\n");
+        if self.session_list.is_empty() {
+            out.push_str("  (no saved sessions yet - chat a little first)\n");
+        }
+        for (i, (_, title)) in self.session_list.iter().enumerate() {
+            let ptr = if i == self.session_cursor { "\x1b[32m>\x1b[0m" } else { " " };
+            out.push_str(&format!("  {ptr} [{}] {}\n", i, title));
+        }
+        out.push_str(&format!("\n{}\n", "-".repeat(cols)));
+        out.push_str("\x1b[2K\x1b[32m>\x1b[0m ");
+        print!("{out}");
+        let _ = io::stdout().flush();
+    }
+
     fn draw(&self, input: &str) {
         self.draw_cursor(input, input.len());
     }
 
     fn draw_cursor(&self, input: &str, cursor: usize) {
         let (cols, rows) = term_size();
-        // Reserve header, two separators, status bar and input line.
-        let body_h = rows.saturating_sub(6).max(3);
+        let q = input.trim_start();
+        let suggestions: Vec<(&str, &str)> = if q.starts_with('/') {
+            COMMANDS.iter().filter(|(name, _)| name.starts_with(q))
+                .take(6).copied().collect()
+        } else { Vec::new() };
+        let extra = if suggestions.is_empty() { 0 } else { suggestions.len() + 2 };
+        // Reserve header, separators, status bar, input line and suggestions.
+        let body_h = rows.saturating_sub(6 + extra).max(3);
         let mut out = String::new();
         out.push_str("\x1b[H\x1b[2J");
         out.push_str(&format!("\x1b[48;5;24m\x1b[97m PERIHEL  \x1b[2m local agent harness \x1b[0m  model:{}  grammar:{}  tools:{}\x1b[0m\n",
@@ -681,6 +811,13 @@ impl App {
             out.push_str("\x1b[2K\n");
         }
         out.push_str(&format!("{}\n", "-".repeat(cols)));
+        if !suggestions.is_empty() {
+            out.push_str("\x1b[1m  commands\x1b[0m\n");
+            for (name, desc) in suggestions {
+                out.push_str(&format!("  \x1b[36m{name}\x1b[0m  \x1b[2m{desc}\x1b[0m\x1b[2K\n"));
+            }
+            out.push_str("\x1b[2m  Tab completes, Enter runs\x1b[0m\x1b[2K\n");
+        }
         let cap = if self.max_rounds == 0 { "inf".into() } else { self.max_rounds.to_string() };
         let tail = if self.client.last_stats.is_empty() { String::new() }
                    else { format!(" | {}", self.client.last_stats) };
@@ -835,6 +972,10 @@ fn main() {
         picking_model: false,
         model_list: Vec::new(),
         model_cursor: 0,
+        picking_session: false,
+        session_list: Vec::new(),
+        session_cursor: 0,
+        session_id: format!("session-{}", chrono_stamp()),
     };
 
     if app.tui {
@@ -846,10 +987,43 @@ fn main() {
 
     if let Some(prompt) = &cli.prompt {
         app.run_turn(prompt);
+        app.save_current_session();
     } else {
         'outer: loop {
             let cmd: String;
             if app.tui {
+                if app.picking_session {
+                    app.draw_session_picker();
+                    match read_key() {
+                        Key::Down | Key::Char('j', false) => {
+                            let n = app.session_list.len().saturating_sub(1);
+                            app.session_cursor = (app.session_cursor + 1).min(n);
+                        }
+                        Key::Up | Key::Char('k', false) => {
+                            app.session_cursor = app.session_cursor.saturating_sub(1);
+                        }
+                        Key::Char(c, false) if c.is_ascii_digit() => {
+                            let i = c.to_digit(10).unwrap_or(0) as usize;
+                            if i < app.session_list.len() { app.session_cursor = i; }
+                        }
+                        Key::Enter => {
+                            if let Some((path, _)) = app.session_list.get(app.session_cursor).cloned() {
+                                match load_session(&mut app.client, &path) {
+                                    Ok(()) => app.inform("session restored"),
+                                    Err(e) => app.inform(&format!("session load failed: {e}")),
+                                }
+                            }
+                            app.picking_session = false;
+                        }
+                        Key::Esc | Key::Char('q', false) => {
+                            app.picking_session = false;
+                            app.inform("session browse cancelled");
+                        }
+                        Key::Char('c', true) => break 'outer,
+                        _ => {}
+                    }
+                    continue;
+                }
                 if app.picking_model {
                     app.draw_picker();
                     match read_key() {
@@ -893,6 +1067,16 @@ fn main() {
                     app.draw_cursor(&buf, cursor);
                     match read_key() {
                         Key::Char('c', true) => break 'outer,
+                        Key::Char('\t', false) if buf.trim_start().starts_with('/') => {
+                            if let Some((name, _)) = COMMANDS.iter()
+                                .find(|(name, _)| name.starts_with(buf.trim_start()))
+                            {
+                                buf.clear();
+                                buf.push_str(name);
+                                buf.push(' ');
+                                cursor = buf.len();
+                            }
+                        }
                         Key::Char(ch, false) => {
                             buf.insert(cursor, ch);
                             cursor += ch.len_utf8();
@@ -950,6 +1134,34 @@ fn main() {
                             }
                         }
                     }
+                    "session" => {
+                        if !rest.trim().is_empty() {
+                            let sessions = list_sessions();
+                            if let Ok(i) = rest.trim().parse::<usize>() {
+                                if let Some((path, _)) = sessions.get(i) {
+                                    match load_session(&mut app.client, path) {
+                                        Ok(()) => app.inform("session restored"),
+                                        Err(e) => app.inform(&format!("session load failed: {e}")),
+                                    }
+                                } else { app.inform("session index out of range"); }
+                            }
+                            continue;
+                        }
+                        app.session_list = list_sessions();
+                        app.session_cursor = 0;
+                        if app.session_list.is_empty() {
+                            app.inform("no saved sessions yet");
+                        } else {
+                            app.picking_session = true;
+                            if app.tui { app.draw_session_picker(); }
+                            else {
+                                for (i, (_, title)) in app.session_list.iter().enumerate() {
+                                    println!("  [{i}] {title}");
+                                }
+                                app.inform("use /session <n> in a TUI, or pick with arrows there");
+                            }
+                        }
+                    }
                     "thinking" => {
                         match rest.trim() {
                             "on" => app.client.thinking = true,
@@ -969,6 +1181,7 @@ fn main() {
                 continue;
             }
             app.run_turn(&cmd);
+            app.save_current_session();
         }
     }
 
