@@ -6,11 +6,15 @@
 //! There is no fixed round limit: Ctrl+C stops at any time.
 
 use clap::Parser;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::enable_raw_mode;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const GRAMMAR: &str = include_str!("../tools.gbnf");
@@ -26,13 +30,15 @@ Tools:
 - {"tool":"fs.copy","args":{"src":"a.bin","dst":"dir/a.bin"}}  copy a file
 - {"tool":"run.cmd","args":{"command":"python","args":["-m","pytest","-q"]}}  run an allowlisted command
 - {"tool":"run.test","args":{"path":"tests/test_x.py"}}  run tests on one file
+- {"tool":"web.search","args":{"query":"latest news"}}  keyless web search (Bing RSS)
+- {"tool":"web.fetch","args":{"url":"https://example.com"}}  fetch a page as readable text
 - {"tool":"reply.text","args":{"text":"..."}}  finish the turn
 Rules: one tool per reply; paths are relative to the workspace, no absolute paths or `..`;
 inspect before writing, verify after writing; never claim success you did not verify."#;
 
 const TOOLS: &[&str] = &[
     "fs.list", "fs.read", "fs.write", "fs.mkdir", "fs.copy",
-    "run.cmd", "run.test", "reply.text",
+    "run.cmd", "run.test", "web.search", "web.fetch", "reply.text",
 ];
 
 #[derive(Parser, Debug)]
@@ -41,8 +47,9 @@ const TOOLS: &[&str] = &[
 struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8090")]
     base_url: String,
-    #[arg(long, default_value = "local-model")]
-    model: String,
+    /// Model name. If omitted, the first available local model is selected.
+    #[arg(long)]
+    model: Option<String>,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
     #[arg(long)]
@@ -57,6 +64,9 @@ struct Cli {
     /// Plain line-oriented CLI instead of the full-screen harness UI.
     #[arg(long)]
     cli: bool,
+    /// Show the model's streamed reasoning (off by default; slow).
+    #[arg(long)]
+    thinking: bool,
 }
 
 // ------------------------------------------------------------------ client
@@ -67,17 +77,38 @@ struct Client {
     grammar: Option<String>,
     messages: Vec<Value>,
     agent: ureq::Agent,
+    thinking: bool,
+    last_stats: String,
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.len() <= max { return s.to_string(); }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+    format!("{}\n... [truncated]", &s[..end])
+}
+
+fn stats_line(tokens: u64, chars: usize, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64().max(0.001);
+    let measured = if tokens > 0 { tokens } else { (chars / 4) as u64 };
+    format!("[stats] {} tokens in {:.1}s = {:.1} tok/s{}",
+        measured, secs, measured as f64 / secs,
+        if tokens > 0 { "" } else { " (estimated)" })
+}
+
+fn print_stats(tokens: u64, chars: usize, elapsed: Duration) {
+    println!("{}", stats_line(tokens, chars, elapsed));
 }
 
 impl Client {
-    fn new(base: &str, model: &str, grammar: Option<String>) -> Self {
+    fn new(base: &str, model: &str, grammar: Option<String>, thinking: bool) -> Self {
         let mut messages = Vec::new();
         messages.push(json!({"role": "system", "content": DEFAULT_SYSTEM}));
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(900)))
             .build();
         let agent = ureq::Agent::new_with_config(config);
-        Self { base: base.trim_end_matches('/').to_string(), model: model.to_string(), grammar, messages, agent }
+        Self { base: base.trim_end_matches('/').to_string(), model: model.to_string(), grammar, messages, agent, thinking, last_stats: String::new() }
     }
 
     fn reset(&mut self) {
@@ -85,16 +116,51 @@ impl Client {
         self.messages.push(json!({"role": "system", "content": DEFAULT_SYSTEM}));
     }
 
+    /// Models available from llama.cpp's /v1/models plus local GGUF files.
+    fn available_models(&self, root: &Path) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if let Ok(resp) = self.agent.get(&format!("{}/v1/models", self.base)).call() {
+            if let Ok(v) = resp.into_body().read_json::<Value>() {
+                if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+                    for m in arr {
+                        if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
+                            // llama.cpp reports the full GGUF path; show the name.
+                            let short = id.rsplit(['\\', '/']).next().unwrap_or(id);
+                            out.push(short.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let dirs = vec![root.to_path_buf(), root.join("models"), PathBuf::from("models")];
+        for dir in dirs {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("gguf") {
+                        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        if !name.to_lowercase().contains("mmproj") { out.push(name); }
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     fn chat(&mut self, stream: bool) -> Result<String, String> {
+        let started = Instant::now();
         let mut body = json!({
             "model": self.model,
             "messages": self.messages,
             "temperature": 0.4,
             "top_p": 0.95,
             "top_k": 20,
-            "max_tokens": 4096,
+            // Cap reasoning: this model can loop for 30k tokens before answering.
+            "max_tokens": if self.thinking { 8000 } else { 4096 },
             "stream": stream,
-            "chat_template_kwargs": {"enable_thinking": false},
+            "chat_template_kwargs": {"enable_thinking": self.thinking},
         });
         if let Some(g) = &self.grammar {
             body["grammar"] = json!(g);
@@ -107,53 +173,75 @@ impl Client {
 
         if !stream {
             let text: Value = resp.into_body().read_json().map_err(|e| format!("bad JSON: {e}"))?;
-            return extract_content(&text);
+            let msg = &text["choices"][0]["message"];
+            let mut content = msg["content"].as_str().unwrap_or("").to_string();
+            // Thinking models can put the answer in reasoning_content.
+            if content.is_empty() {
+                content = msg["reasoning_content"].as_str().unwrap_or("").to_string();
+            }
+            if content.is_empty() && self.thinking {
+                // The reasoning loop ate the budget: retry once with it off.
+                self.thinking = false;
+                let retry = self.chat(stream);
+                self.thinking = true;
+                return retry;
+            }
+            if content.is_empty() {
+                return Err("empty completion (reasoning may have consumed the budget)".into());
+            }
+            let toks = text["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+            self.last_stats = stats_line(toks, content.len(), started.elapsed());
+            return Ok(content);
         }
 
-        // SSE: read `data: {...}` lines, stream delta content to stdout.
+        // SSE: stream reasoning and content deltas as they arrive (typewriter).
         let reader = resp.into_body().into_reader();
         let mut full = String::new();
-        let mut last_progress = Instant::now();
+        let mut reasoning = String::new();
+        let mut tokens = 0u64;
+        let mut thinking_header = false;
         for line in io::BufReader::new(reader).lines() {
             let line = line.map_err(|e| format!("stream read error: {e}"))?;
-            if !line.starts_with("data:") {
-                continue;
-            }
+            if !line.starts_with("data:") { continue; }
             let data = line[5..].trim();
-            if data == "[DONE]" {
-                break;
-            }
+            if data == "[DONE]" { break; }
             let piece: Value = match serde_json::from_str(data) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let delta = piece["choices"][0]["delta"]["content"].as_str().unwrap_or("");
-            if !delta.is_empty() {
-                full.push_str(delta);
-                print!("{delta}");
+            if let Some(t) = piece["usage"]["completion_tokens"].as_u64() { tokens = t; }
+            let delta = &piece["choices"][0]["delta"];
+            // The chat template puts thinking in reasoning_content.
+            let reasoning_delta = delta["reasoning_content"].as_str().unwrap_or("");
+            if !reasoning_delta.is_empty() {
+                if !thinking_header {
+                    print!("\n\x1b[2m[thinking] ");
+                    thinking_header = true;
+                }
+                reasoning.push_str(reasoning_delta);
+                print!("\x1b[2m{reasoning_delta}\x1b[0m");
                 let _ = io::stdout().flush();
-                last_progress = Instant::now();
             }
-            let _ = last_progress;
+            let content = delta["content"].as_str().unwrap_or("");
+            if !content.is_empty() {
+                if thinking_header {
+                    print!("\x1b[0m\n");
+                    thinking_header = false;
+                }
+                full.push_str(content);
+                print!("{content}");
+                let _ = io::stdout().flush();
+            }
         }
+        if thinking_header { print!("\x1b[0m"); }
         println!();
+        // Some llama.cpp builds route the grammar-constrained tool call into
+        // reasoning_content instead of content.
+        let chars = if full.is_empty() { reasoning.len() } else { full.len() + reasoning.len() };
+        if full.is_empty() { full = reasoning.clone(); }
+        self.last_stats = stats_line(tokens, chars, started.elapsed());
+        print_stats(tokens, chars, started.elapsed());
         Ok(full)
-    }
-}
-
-fn extract_content(payload: &Value) -> Result<String, String> {
-    let choices = payload.get("choices").and_then(|v| v.as_array())
-        .ok_or_else(|| format!("no choices: {}", payload))?;
-    let content = choices.first()
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
-    if content.is_empty() {
-        Err("empty completion (reasoning may have consumed the budget)".into())
-    } else {
-        Ok(content)
     }
 }
 
@@ -233,6 +321,131 @@ fn run_process(argv: &[String], cwd: &Path) -> Result<(bool, String), String> {
     }
 }
 
+// ------------------------------------------------------------------ web tools
+
+#[derive(Default)]
+struct WebRate { last: Option<Instant>, times: VecDeque<Instant> }
+static WEB_RATE: OnceLock<Mutex<WebRate>> = OnceLock::new();
+
+fn web_slot() -> Result<(), String> {
+    let mut state = WEB_RATE.get_or_init(|| Mutex::new(WebRate::default()))
+        .lock().map_err(|e| e.to_string())?;
+    let now = Instant::now();
+    state.times.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+    if let Some(last) = state.last {
+        if now.duration_since(last) < Duration::from_secs(5) {
+            return Err("web rate limit: wait 5s between calls".into());
+        }
+    }
+    if state.times.len() >= 10 {
+        return Err("web rate limit: 10 calls per minute reached".into());
+    }
+    state.last = Some(now);
+    state.times.push_back(now);
+    Ok(())
+}
+
+fn html_unescape(s: &str) -> String {
+    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ")
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.as_bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn http_get(url: &str, timeout_s: u64) -> Result<String, String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("only http(s) URLs are allowed".into());
+    }
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(timeout_s)))
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let resp = agent.get(url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; perihel-local/0.1)")
+        .call()
+        .map_err(|e| format!("request failed: {e}"))?;
+    let mut body = resp.into_body();
+    let bytes = body.read_to_vec().map_err(|e| format!("read failed: {e}"))?;
+    let limited = if bytes.len() > 2 * 1024 * 1024 { &bytes[..2 * 1024 * 1024] } else { &bytes };
+    Ok(String::from_utf8_lossy(limited).to_string())
+}
+
+fn web_search(args: &Value) -> ToolResult {
+    let query = match arg_str(args, "query") { Ok(q) => q, Err(e) => return ToolResult { ok: false, output: String::new(), refused: Some(e) } };
+    if let Err(e) = web_slot() {
+        return ToolResult { ok: false, output: String::new(), refused: Some(e) };
+    }
+    let url = format!("https://www.bing.com/search?format=rss&q={}", url_encode(query));
+    let body = match http_get(&url, 15) {
+        Ok(b) => b,
+        Err(e) => return ToolResult { ok: false, output: e, refused: None },
+    };
+    let mut out = Vec::new();
+    for item in body.split("<item>").skip(1) {
+        let item = item.split("</item>").next().unwrap_or(item);
+        let tag = |name: &str| -> String {
+            let open = format!("<{name}>");
+            let close = format!("</{name}>");
+            item.split_once(&open)
+                .and_then(|(_, rest)| rest.split_once(&close))
+                .map(|(v, _)| html_unescape(v.trim().trim_start_matches("<![CDATA[").trim_end_matches("]]>").trim()))
+                .unwrap_or_default()
+        };
+        let title = tag("title");
+        let link = tag("link");
+        let desc = tag("description");
+        if !title.is_empty() {
+            out.push(format!("- {title}\n  {link}\n  {}", truncate_chars(&desc, 300)));
+        }
+        if out.len() >= 8 { break; }
+    }
+    let text = if out.is_empty() { "no results (Bing RSS returned no items)".into() } else { out.join("\n") };
+    ToolResult { ok: true, output: text, refused: None }
+}
+
+fn web_fetch(args: &Value) -> ToolResult {
+    let url = match arg_str(args, "url") { Ok(u) => u, Err(e) => return ToolResult { ok: false, output: String::new(), refused: Some(e) } };
+    if let Err(e) = web_slot() {
+        return ToolResult { ok: false, output: String::new(), refused: Some(e) };
+    }
+    let html = match http_get(url, 15) {
+        Ok(h) => h,
+        Err(e) => return ToolResult { ok: false, output: e, refused: None },
+    };
+    let mut text = String::new();
+    let mut skip = 0usize;
+    let mut rest = html.as_str();
+    while let Some(pos) = rest.find('<') {
+        text.push_str(&html_unescape(&rest[..pos]));
+        let after = &rest[pos..];
+        if let Some(end) = after.find('>') {
+            let tag = after[1..end].trim().to_ascii_lowercase();
+            if tag.starts_with("script") || tag.starts_with("style") || tag.starts_with("nav")
+                || tag.starts_with("header") || tag.starts_with("footer") || tag.starts_with("svg") {
+                if !tag.starts_with('/') { skip += 1; }
+            } else if tag.starts_with('/') { skip = skip.saturating_sub(1); }
+            else if ["p", "h1", "h2", "h3", "li", "br", "div", "section", "article"].iter().any(|t| tag.starts_with(t)) {
+                text.push('\n');
+            }
+            rest = &after[end + 1..];
+        } else { break; }
+    }
+    text.push_str(rest);
+    let collapsed: Vec<&str> = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    let out = truncate_chars(&collapsed.join("\n"), 6000);
+    let _ = skip;
+    ToolResult { ok: true, output: out, refused: None }
+}
+
 struct ToolResult { ok: bool, output: String, refused: Option<String> }
 
 impl ToolResult {
@@ -241,7 +454,7 @@ impl ToolResult {
             format!("TOOL RESULT: REFUSED — {r}\nPick a different tool or fix the arguments.")
         } else {
             format!("TOOL RESULT ({}):\n{}", if self.ok { "OK" } else { "FAILED" },
-                    &self.output[..self.output.len().min(6000)])
+                    &truncate_chars(&self.output, 6000))
         }
     }
 }
@@ -318,6 +531,14 @@ fn execute(call: &Value, root: &Path) -> ToolResult {
             let (ok, out) = run_process(&argv, root)?;
             Ok(ToolResult { ok, output: out, refused: None })
         })()),
+        "web.search" => wrap((|| {
+            let r = web_search(args);
+            Ok(r)
+        })()),
+        "web.fetch" => wrap((|| {
+            let r = web_fetch(args);
+            Ok(r)
+        })()),
         _ => ToolResult { ok: false, output: String::new(), refused: Some(format!("unknown tool: {name}")) },
     }
 }
@@ -342,12 +563,21 @@ struct App {
     tui: bool,
     round: usize,
     history: Vec<(String, String)>,
+    picking_model: bool,
+    model_list: Vec<String>,
+    model_cursor: usize,
 }
 
 impl App {
     fn add(&mut self, kind: &str, text: &str) {
         self.history.push((kind.to_string(), text.to_string()));
         if self.tui { self.draw(""); }
+    }
+
+    /// Print a message that survives the full-screen redraw in TUI mode.
+    fn inform(&mut self, text: &str) {
+        if self.tui { self.add("system", text); }
+        else { println!("{text}"); }
     }
 
     fn run_turn(&mut self, user: &str) {
@@ -359,27 +589,35 @@ impl App {
             self.round = round;
             if self.tui { self.draw(""); }
             else { println!("[round {}] thinking...", round); }
+            if self.tui {
+                self.add("system", "generating... (Ctrl+C stops)");
+            }
             let raw = match self.client.chat(!self.tui) {
                 Ok(r) => r,
                 Err(e) => { self.add("error", &e); return; }
             };
             let call = match parse_call(&raw) {
                 Some(c) => c,
-                None => { self.add("assistant", raw.trim()); return; }
+                None => {
+                    if !self.tui { println!("[assistant] {}", raw.trim()); }
+                    self.add("assistant", raw.trim());
+                    return;
+                }
             };
             self.client.messages.push(json!({"role":"assistant","content":raw}));
             let name = call["tool"].as_str().unwrap_or("").to_string();
             if name == "reply.text" {
                 let text = call["args"]["text"].as_str().unwrap_or("").to_string();
+                if !self.tui { println!("[assistant] {text}"); }
                 self.add("assistant", &text);
                 return;
             }
             let result = execute(&call, &self.root);
             let preview = result.refused.clone().unwrap_or_else(|| result.output.lines().next().unwrap_or("").to_string());
             if !self.tui {
-                println!("[tool] {name} -> {}", &preview[..preview.len().min(160)]);
+                println!("[tool] {name} -> {}", truncate_chars(&preview, 160));
             }
-            self.add("tool", &format!("{name} -> {}", &preview[..preview.len().min(160)]));
+            self.add("tool", &format!("{name} -> {}", truncate_chars(&preview, 160)));
             self.client.messages.push(json!({"role":"user","content":result.message()}));
             if self.max_rounds > 0 && round >= self.max_rounds {
                 self.add("error", "round limit reached (--max-rounds)");
@@ -389,9 +627,33 @@ impl App {
     }
 
     // Minimal full-screen harness-style rendering with ANSI escapes.
+    fn draw_picker(&self) {
+        let (cols, _) = term_size();
+        let mut out = String::from("\x1b[H\x1b[2J");
+        out.push_str(&format!("\x1b[48;5;24m\x1b[97m SELECT MODEL \x1b[0m  {}\x1b[0m\n", self.client.model));
+        out.push_str(&format!("{}\n", "-".repeat(cols)));
+        out.push_str("  arrows / j k : move   number : jump   Enter : select   q : cancel\n\n");
+        for (i, m) in self.model_list.iter().enumerate() {
+            let ptr = if i == self.model_cursor { "\x1b[32m>\x1b[0m" } else { " " };
+            let name = if m == &self.client.model {
+                format!("{m}  \x1b[2m(current)\x1b[0m")
+            } else { m.clone() };
+            out.push_str(&format!("  {ptr} [{}] {}\n", i, name));
+        }
+        out.push_str(&format!("\n{}\n", "-".repeat(cols)));
+        out.push_str("\x1b[2K\x1b[32m>\x1b[0m ");
+        print!("{out}");
+        let _ = io::stdout().flush();
+    }
+
     fn draw(&self, input: &str) {
+        self.draw_cursor(input, input.len());
+    }
+
+    fn draw_cursor(&self, input: &str, cursor: usize) {
         let (cols, rows) = term_size();
-        let body_h = rows.saturating_sub(5).max(4);
+        // Reserve header, two separators, status bar and input line.
+        let body_h = rows.saturating_sub(6).max(3);
         let mut out = String::new();
         out.push_str("\x1b[H\x1b[2J");
         out.push_str(&format!("\x1b[48;5;24m\x1b[97m PERIHEL  \x1b[2m local agent harness \x1b[0m  model:{}  grammar:{}  tools:{}\x1b[0m\n",
@@ -413,26 +675,50 @@ impl App {
         let start = lines.len().saturating_sub(body_h);
         for line in &lines[start..] {
             out.push_str(line);
-            out.push_str("\n");
+            out.push_str("\x1b[2K\n"); // erase anything left over on this row
         }
-        for _ in 0..body_h.saturating_sub(lines.len().saturating_sub(start)) { out.push('\n'); }
+        for _ in 0..body_h.saturating_sub(lines.len().saturating_sub(start)) {
+            out.push_str("\x1b[2K\n");
+        }
         out.push_str(&format!("{}\n", "-".repeat(cols)));
-        out.push_str(&format!("\x1b[48;5;236m Enter send | /help | /model <name> | /quit | Ctrl+C stop | round {}/{}\x1b[0m\n",
-            self.round, if self.max_rounds == 0 { "inf".into() } else { self.max_rounds.to_string() }));
-        out.push_str("\x1b[32m>\x1b[0m ");
-        out.push_str(input);
+        let cap = if self.max_rounds == 0 { "inf".into() } else { self.max_rounds.to_string() };
+        let tail = if self.client.last_stats.is_empty() { String::new() }
+                   else { format!(" | {}", self.client.last_stats) };
+        out.push_str(&format!("\x1b[48;5;236m Enter send | /model [name] | /thinking | /quit | Ctrl+C | round {}/{}{}\x1b[0m\n",
+            self.round, cap, tail));
+        out.push_str("\x1b[2K\x1b[32m>\x1b[0m "); // clear the input line first
+        let c = cursor.min(input.len());
+        out.push_str(&input[..c]);
+        match input[c..].chars().next() {
+            Some(ch) => {
+                out.push_str(&format!("\x1b[7m{ch}\x1b[0m"));
+                out.push_str(&input[c + ch.len_utf8()..]);
+            }
+            None => out.push_str("\x1b[7m \x1b[0m"),
+        }
         print!("{out}");
         let _ = io::stdout().flush();
     }
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(20);
+    // Leave room for the 2-char role prefix and a safety margin.
+    let width = width.max(20).saturating_sub(4);
     let mut out = Vec::new();
     for line in text.lines() {
-        if line.len() <= width { out.push(line.to_string()); continue; }
+        if line.is_empty() { out.push(String::new()); continue; }
         let mut cur = String::new();
         for word in line.split_whitespace() {
+            if word.len() > width {
+                if !cur.is_empty() { out.push(cur.clone()); cur.clear(); }
+                let mut rest = word;
+                while rest.len() > width {
+                    out.push(rest[..width].to_string());
+                    rest = &rest[width..];
+                }
+                cur.push_str(rest);
+                continue;
+            }
             if !cur.is_empty() && cur.len() + word.len() + 1 > width {
                 out.push(cur.clone());
                 cur.clear();
@@ -444,6 +730,55 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     }
     if out.is_empty() { out.push(String::new()); }
     out
+}
+
+#[derive(Debug)]
+enum Key {
+    Char(char, bool), Enter, Left, Right, Up, Down, Backspace, Delete, Home, End, Esc, Other,
+}
+
+/// Read one key in raw mode. Raw mode is disabled again before returning, so
+/// Ctrl+C during a generation terminates the process normally.
+fn read_key() -> Key {
+    if enable_raw_mode().is_err() {
+        let mut line = String::new();
+        return match io::stdin().read_line(&mut line) {
+            Ok(0) => Key::Esc,
+            Ok(_) => Key::Char(line.chars().next().unwrap_or('\n'), false),
+            Err(_) => Key::Esc,
+        };
+    }
+    loop {
+        if let Ok(Event::Key(k)) = event::read() {
+            if k.kind != KeyEventKind::Press { continue; }
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            let key = match k.code {
+                KeyCode::Enter => Key::Enter,
+                KeyCode::Left => Key::Left,
+                KeyCode::Right => Key::Right,
+                KeyCode::Up => Key::Up,
+                KeyCode::Down => Key::Down,
+                KeyCode::Backspace => Key::Backspace,
+                KeyCode::Delete => Key::Delete,
+                KeyCode::Home => Key::Home,
+                KeyCode::End => Key::End,
+                KeyCode::Esc => Key::Esc,
+                KeyCode::Char(c) => Key::Char(c, ctrl),
+                _ => Key::Other,
+            };
+            let _ = crossterm::terminal::disable_raw_mode();
+            return key;
+        }
+    }
+}
+
+fn prev_boundary(s: &str, pos: usize) -> usize {
+    s[..pos].char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
+}
+
+fn next_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() { return s.len(); }
+    s[pos..].char_indices().nth(1).map(|(i, _)| pos + i).unwrap_or(s.len())
 }
 
 fn term_size() -> (usize, usize) {
@@ -460,7 +795,8 @@ fn banner(app: &App) {
         if app.max_rounds == 0 { "unlimited".into() } else { app.max_rounds.to_string() },
         if app.client.grammar.is_some() { "ON" } else { "OFF" },
         app.root.display());
-    println!("Type /help for commands, Ctrl+C to stop.");
+    println!("Type /help for commands, Ctrl+C to stop. Thinking: {}",
+        if app.client.thinking { "ON" } else { "OFF" });
 }
 
 fn main() {
@@ -477,7 +813,18 @@ fn main() {
             None => GRAMMAR.to_string(),
         })
     };
-    let client = Client::new(&cli.base_url, &cli.model, grammar);
+    let mut client = Client::new(
+        &cli.base_url,
+        cli.model.as_deref().unwrap_or("local-model"),
+        grammar,
+        cli.thinking,
+    );
+    // No --model given: pick the first real model instead of a placeholder.
+    if cli.model.is_none() {
+        if let Some(first) = client.available_models(&root).into_iter().next() {
+            client.model = first;
+        }
+    }
     let mut app = App {
         client,
         root,
@@ -485,6 +832,9 @@ fn main() {
         tui: !cli.cli,
         round: 0,
         history: Vec::new(),
+        picking_model: false,
+        model_list: Vec::new(),
+        model_cursor: 0,
     };
 
     if app.tui {
@@ -497,37 +847,128 @@ fn main() {
     if let Some(prompt) = &cli.prompt {
         app.run_turn(prompt);
     } else {
-        loop {
-            let mut line = String::new();
-            if app.tui { app.draw(""); }
-            match io::stdin().read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => { eprintln!("input error: {e}"); break; }
+        'outer: loop {
+            let cmd: String;
+            if app.tui {
+                if app.picking_model {
+                    app.draw_picker();
+                    match read_key() {
+                        Key::Down | Key::Char('j', false) => {
+                            let n = app.model_list.len().saturating_sub(1);
+                            app.model_cursor = (app.model_cursor + 1).min(n);
+                        }
+                        Key::Up | Key::Char('k', false) => {
+                            app.model_cursor = app.model_cursor.saturating_sub(1);
+                        }
+                        Key::Char(c, false) if c.is_ascii_digit() => {
+                            let i = c.to_digit(10).unwrap_or(0) as usize;
+                            if i < app.model_list.len() {
+                                app.model_cursor = i;
+                                app.client.model = app.model_list[i].clone();
+                                app.picking_model = false;
+                                app.inform(&format!("model = {}", app.client.model));
+                            }
+                        }
+                        Key::Enter => {
+                            if let Some(m) = app.model_list.get(app.model_cursor).cloned() {
+                                app.client.model = m;
+                            }
+                            app.picking_model = false;
+                            app.inform(&format!("model = {}", app.client.model));
+                        }
+                        Key::Esc | Key::Char('q', false) => {
+                            app.picking_model = false;
+                            app.inform("model selection cancelled");
+                        }
+                        Key::Char('c', true) => break 'outer,
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Full-screen line editor with a visible block cursor.
+                let mut buf = String::new();
+                let mut cursor = 0usize;
+                loop {
+                    app.draw_cursor(&buf, cursor);
+                    match read_key() {
+                        Key::Char('c', true) => break 'outer,
+                        Key::Char(ch, false) => {
+                            buf.insert(cursor, ch);
+                            cursor += ch.len_utf8();
+                        }
+                        Key::Backspace if cursor > 0 => {
+                            cursor = prev_boundary(&buf, cursor);
+                            buf.remove(cursor);
+                        }
+                        Key::Delete if cursor < buf.len() => { buf.remove(cursor); }
+                        Key::Left => cursor = prev_boundary(&buf, cursor),
+                        Key::Right => cursor = next_boundary(&buf, cursor),
+                        Key::Home => cursor = 0,
+                        Key::End => cursor = buf.len(),
+                        Key::Enter => break,
+                        Key::Esc => { buf.clear(); cursor = 0; }
+                        _ => {}
+                    }
+                }
+                cmd = buf;
+            } else {
+                let mut line = String::new();
+                match io::stdin().read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => { eprintln!("input error: {e}"); break; }
+                }
+                cmd = line.trim().to_string();
             }
-            let cmd = line.trim();
+
+            // Model picker: arrows/j-k move, digits jump, Enter selects, q cancels.
             if cmd.is_empty() { continue; }
             if cmd.starts_with('/') {
                 let (verb, rest) = cmd[1..].split_once(' ').unwrap_or((&cmd[1..], ""));
                 match verb {
                     "quit" | "exit" => break,
-                    "help" => println!("/help /quit /reset /model <name> /rounds <n> /tools /workspace"),
-                    "reset" => { app.client.reset(); app.history.clear(); println!("conversation reset"); }
+                    "help" => app.inform("/help /quit /reset /model [name] /rounds <n> /thinking on|off /tools /workspace"),
+                    "reset" => {
+                        app.client.reset();
+                        app.history.clear();
+                        app.inform("conversation reset");
+                    }
                     "model" => {
-                        if !rest.is_empty() { app.client.model = rest.trim().to_string(); }
-                        println!("model = {}", app.client.model);
+                        if !rest.is_empty() {
+                            app.client.model = rest.trim().to_string();
+                            app.inform(&format!("model = {}", app.client.model));
+                        } else {
+                            app.model_list = app.client.available_models(&app.root);
+                            app.model_cursor = app.model_list.iter()
+                                .position(|m| m == &app.client.model).unwrap_or(0);
+                            if app.model_list.is_empty() {
+                                app.inform("no models found; add a .gguf to a models/ folder");
+                            } else {
+                                app.picking_model = true;
+                                if app.tui { app.draw_picker(); }
+                            }
+                        }
+                    }
+                    "thinking" => {
+                        match rest.trim() {
+                            "on" => app.client.thinking = true,
+                            "off" => app.client.thinking = false,
+                            _ => {}
+                        }
+                        app.inform(&format!("thinking output = {}", if app.client.thinking { "ON" } else { "OFF" }));
                     }
                     "rounds" => {
                         if let Ok(n) = rest.trim().parse::<usize>() { app.max_rounds = n; }
-                        println!("max rounds = {}", app.max_rounds);
+                        app.inform(&format!("max rounds = {}", app.max_rounds));
                     }
-                    "tools" => println!("{}", TOOLS.join(", ")),
-                    "workspace" => println!("{}", app.root.display()),
-                    _ => println!("unknown command: {verb}"),
+                    "tools" => app.inform(&TOOLS.join(", ")),
+                    "workspace" => app.inform(&app.root.display().to_string()),
+                    _ => app.inform(&format!("unknown command: {verb}")),
                 }
                 continue;
             }
-            app.run_turn(cmd);
+            app.run_turn(&cmd);
         }
     }
 
