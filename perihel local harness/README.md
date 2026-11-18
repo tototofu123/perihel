@@ -27,7 +27,7 @@ perihel --model my-model                  # choose a model at startup
 perihel --workspace C:\some\project       # sandbox root
 ```
 
-In-session commands: `/help`, `/model [name]`, `/rounds <n>`,
+In-session commands: `/help`, `/model [name]`, `/session`, `/rounds <n>`,
 `/thinking on|off`, `/reset`, `/tools`, `/workspace`, `/quit`.
 `/model` with **no argument lists available models** (from llama.cpp
 `/v1/models` plus local `.gguf` files). `/rounds 0` (the default) means
@@ -61,6 +61,14 @@ line so the session does not look locked; the status bar shows the round and the
 last timing stats. The input line is cleared at the start of every redraw to
 avoid overlapping text on short windows.
 
+The layout uses the **real terminal size** reported by the console, not the
+`COLUMNS` environment variable (Windows never sets it). Before this, the TUI
+laid itself out for 120 columns inside a narrow window: lines were cut off at
+the right edge, the status bar wrapped onto a second row, and the body scrolled
+past the header. Long input now scrolls horizontally with a `<` marker instead
+of wrapping into the status bar. `cargo test` covers the invariants (no rendered
+row wider than the window, no frame taller than the window).
+
 ## How tool calling works
 
 llama.cpp has no native tool-call API, so `tools.gbnf` is embedded in the binary
@@ -69,8 +77,11 @@ cannot emit an unknown tool or malformed arguments. One JSON tool call per turn;
 its result is fed back as a user message (Perihel `copilot.rs` pattern).
 
 Tools: `fs.list`, `fs.read`, `fs.write`, `fs.mkdir`, `fs.copy`, `run.cmd`,
-`run.test`, `reply.text`. All paths are workspace-sandboxed, commands are
-allowlisted with no shell, 60 s timeout, bounded output. `enable_thinking` is
+`run.test`, `web.search`, `web.fetch`, `reply.text`. All paths are
+workspace-sandboxed, commands are
+allowlisted with no shell, 60 s timeout, bounded output. `web.search` uses
+keyless Bing RSS (8 results, 5 s gap, 10/min) and `web.fetch` strips
+script/style/nav from a page (2 MB cap, 6k chars). `enable_thinking` is
 off to avoid the reasoning loops measured with Qwen3.5-4B.
 
 ## Desktop shortcuts

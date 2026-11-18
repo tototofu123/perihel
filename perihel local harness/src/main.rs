@@ -736,7 +736,7 @@ impl App {
         let (cols, _) = term_size();
         let mut out = String::from("\x1b[H\x1b[2J");
         out.push_str(&format!("\x1b[48;5;24m\x1b[97m SELECT MODEL \x1b[0m  {}\x1b[0m\n", self.client.model));
-        out.push_str(&format!("{}\n", "-".repeat(cols)));
+        out.push_str(&format!("{}\n", "-".repeat(cols.saturating_sub(1))));
         out.push_str("  arrows / j k : move   number : jump   Enter : select   q : cancel\n\n");
         for (i, m) in self.model_list.iter().enumerate() {
             let ptr = if i == self.model_cursor { "\x1b[32m>\x1b[0m" } else { " " };
@@ -755,7 +755,7 @@ impl App {
         let (cols, _) = term_size();
         let mut out = String::from("\x1b[H\x1b[2J");
         out.push_str("\x1b[48;5;24m\x1b[97m SESSIONS \x1b[0m  recent conversations\x1b[0m\n");
-        out.push_str(&format!("{}\n", "-".repeat(cols)));
+        out.push_str(&format!("{}\n", "-".repeat(cols.saturating_sub(1))));
         out.push_str("  arrows / j k : move   number : jump   Enter : restore   q : cancel\n\n");
         if self.session_list.is_empty() {
             out.push_str("  (no saved sessions yet - chat a little first)\n");
@@ -776,6 +776,14 @@ impl App {
 
     fn draw_cursor(&self, input: &str, cursor: usize) {
         let (cols, rows) = term_size();
+        let out = self.frame_with_size(input, cursor, cols, rows);
+        print!("{out}");
+        let _ = io::stdout().flush();
+    }
+
+    /// Build one full screen frame. Kept separate from drawing so layout can be
+    /// unit-tested at a fixed size.
+    fn frame_with_size(&self, input: &str, cursor: usize, cols: usize, rows: usize) -> String {
         let q = input.trim_start();
         let suggestions: Vec<(&str, &str)> = if q.starts_with('/') {
             COMMANDS.iter().filter(|(name, _)| name.starts_with(q))
@@ -783,12 +791,13 @@ impl App {
         } else { Vec::new() };
         let extra = if suggestions.is_empty() { 0 } else { suggestions.len() + 2 };
         // Reserve header, separators, status bar, input line and suggestions.
-        let body_h = rows.saturating_sub(6 + extra).max(3);
+        let body_h = rows.saturating_sub(6 + extra).max(1);
         let mut out = String::new();
         out.push_str("\x1b[H\x1b[2J");
-        out.push_str(&format!("\x1b[48;5;24m\x1b[97m PERIHEL  \x1b[2m local agent harness \x1b[0m  model:{}  grammar:{}  tools:{}\x1b[0m\n",
-            &self.client.model, if self.client.grammar.is_some() {"ON"} else {"OFF"}, TOOLS.len()));
-        out.push_str(&format!("{}\n", "-".repeat(cols)));
+        let header = format!(" PERIHEL  local agent harness  model:{}  grammar:{}  tools:{}",
+            &self.client.model, if self.client.grammar.is_some() {"ON"} else {"OFF"}, TOOLS.len());
+        out.push_str(&format!("\x1b[48;5;24m\x1b[97m{}\x1b[0m\n", clip_plain(&header, cols.saturating_sub(1))));
+        out.push_str(&format!("{}\n", "-".repeat(cols.saturating_sub(1))));
         let mut lines: Vec<String> = Vec::new();
         for (kind, text) in &self.history {
             let prefix = match kind.as_str() {
@@ -810,58 +819,83 @@ impl App {
         for _ in 0..body_h.saturating_sub(lines.len().saturating_sub(start)) {
             out.push_str("\x1b[2K\n");
         }
-        out.push_str(&format!("{}\n", "-".repeat(cols)));
+        out.push_str(&format!("{}\n", "-".repeat(cols.saturating_sub(1))));
         if !suggestions.is_empty() {
             out.push_str("\x1b[1m  commands\x1b[0m\n");
             for (name, desc) in suggestions {
-                out.push_str(&format!("  \x1b[36m{name}\x1b[0m  \x1b[2m{desc}\x1b[0m\x1b[2K\n"));
+                let row = format!("  {name}  {desc}");
+                out.push_str(&format!("{}\x1b[2K\n", clip_plain(&row, cols)));
             }
             out.push_str("\x1b[2m  Tab completes, Enter runs\x1b[0m\x1b[2K\n");
         }
         let cap = if self.max_rounds == 0 { "inf".into() } else { self.max_rounds.to_string() };
-        let tail = if self.client.last_stats.is_empty() { String::new() }
-                   else { format!(" | {}", self.client.last_stats) };
-        out.push_str(&format!("\x1b[48;5;236m Enter send | /model [name] | /thinking | /quit | Ctrl+C | round {}/{}{}\x1b[0m\n",
-            self.round, cap, tail));
-        out.push_str("\x1b[2K\x1b[32m>\x1b[0m "); // clear the input line first
-        let c = cursor.min(input.len());
-        out.push_str(&input[..c]);
-        match input[c..].chars().next() {
-            Some(ch) => {
-                out.push_str(&format!("\x1b[7m{ch}\x1b[0m"));
-                out.push_str(&input[c + ch.len_utf8()..]);
-            }
-            None => out.push_str("\x1b[7m \x1b[0m"),
+        // Keep the status bar to one row: drop optional pieces on narrow terminals.
+        let mut bar = String::from(" Enter send | /model | /session | /thinking | /quit | Ctrl+C");
+        let round = format!(" | round {}/{}", self.round, cap);
+        if disp_width_in(&bar) + disp_width_in(&round) + 2 <= cols { bar.push_str(&round); }
+        if !self.client.last_stats.is_empty() {
+            let stats = format!(" | {}", self.client.last_stats);
+            if disp_width_in(&bar) + disp_width_in(&stats) + 2 <= cols { bar.push_str(&stats); }
         }
-        print!("{out}");
-        let _ = io::stdout().flush();
+        out.push_str(&format!("\x1b[48;5;236m\x1b[97m{}\x1b[0m\n", clip_plain(&bar, cols.saturating_sub(1))));
+        out.push_str("\x1b[2K\x1b[32m>\x1b[0m "); // clear the input line first
+        // Horizontal scroll so a long line never wraps into the status bar.
+        let c = cursor.min(input.len());
+        let chars: Vec<char> = input.chars().collect();
+        let cidx = input[..c].chars().count();
+        let avail = cols.saturating_sub(5).max(8);
+        let start = if cidx >= avail { cidx + 1 - avail } else { 0 };
+        let end = (start + avail).min(chars.len());
+        if start > 0 { out.push_str("\x1b[2m<\x1b[0m"); }
+        for (i, ch) in chars[start..end].iter().enumerate() {
+            let idx = start + i;
+            if idx == cidx {
+                out.push_str(&format!("\x1b[7m{ch}\x1b[0m"));
+            } else {
+                out.push(*ch);
+            }
+        }
+        if cidx >= end { out.push_str("\x1b[7m \x1b[0m"); }
+        out
     }
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {
-    // Leave room for the 2-char role prefix and a safety margin.
-    let width = width.max(20).saturating_sub(4);
+    let width = width.max(16).saturating_sub(2);
     let mut out = Vec::new();
     for line in text.lines() {
-        if line.is_empty() { out.push(String::new()); continue; }
+        if line.trim().is_empty() { out.push(String::new()); continue; }
         let mut cur = String::new();
+        let mut cur_w = 0usize;
         for word in line.split_whitespace() {
-            if word.len() > width {
-                if !cur.is_empty() { out.push(cur.clone()); cur.clear(); }
-                let mut rest = word;
-                while rest.len() > width {
-                    out.push(rest[..width].to_string());
-                    rest = &rest[width..];
+            let word_w: usize = word.chars().map(char_width).sum();
+            if word_w > width {
+                if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
+                let mut piece = String::new();
+                let mut piece_w = 0usize;
+                for c in word.chars() {
+                    let cw = char_width(c);
+                    if piece_w + cw > width {
+                        out.push(std::mem::take(&mut piece));
+                        piece_w = 0;
+                    }
+                    piece.push(c);
+                    piece_w += cw;
                 }
-                cur.push_str(rest);
+                cur = piece;
+                cur_w = piece_w;
                 continue;
             }
-            if !cur.is_empty() && cur.len() + word.len() + 1 > width {
-                out.push(cur.clone());
-                cur.clear();
+            let extra = if cur.is_empty() { 0 } else { 1 };
+            if cur_w + extra + word_w > width {
+                out.push(std::mem::take(&mut cur));
+                cur.push_str(word);
+                cur_w = word_w;
+            } else {
+                if !cur.is_empty() { cur.push(' '); }
+                cur.push_str(word);
+                cur_w += extra + word_w;
             }
-            if !cur.is_empty() { cur.push(' '); }
-            cur.push_str(word);
         }
         if !cur.is_empty() { out.push(cur); }
     }
@@ -919,10 +953,58 @@ fn next_boundary(s: &str, pos: usize) -> usize {
 }
 
 fn term_size() -> (usize, usize) {
-    // Windows Terminal reports size through the console; fall back for redirects.
-    let cols = std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
-    let rows = std::env::var("LINES").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+    // Ask the real console first. COLUMNS/LINES are not set on Windows, which
+    // used to make us lay out for 120 columns inside a narrow window: lines
+    // soft-wrapped, every row count was wrong, and text got clipped.
+    if let Ok((c, r)) = crossterm::terminal::size() {
+        if c >= 20 && r >= 8 { return (c as usize, r as usize); }
+    }
+    let cols = std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok()).unwrap_or(80);
+    let rows = std::env::var("LINES").ok().and_then(|s| s.parse().ok()).unwrap_or(24);
     (cols, rows)
+}
+
+/// Display columns used by a char (CJK and fullwidth forms take two).
+fn char_width(c: char) -> usize {
+    match c as u32 {
+        0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF | 0xA000..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE6F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F | 0x1F900..=0x1F9FF | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+fn disp_width_in(s: &str) -> usize {
+    let mut w = 0usize;
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\x1b' {
+            // Skip a CSI sequence: ESC [ params... final-byte(@..~).
+            if it.peek() == Some(&'[') {
+                it.next();
+                for d in it.by_ref() {
+                    if ('\x40'..='\x7e').contains(&d) { break; }
+                }
+            }
+            continue;
+        }
+        w += char_width(c);
+    }
+    w
+}
+
+/// Clip plain (no ANSI) text to at most `cols` display columns.
+fn clip_plain(s: &str, cols: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = char_width(c);
+        if w + cw > cols { break; }
+        out.push(c);
+        w += cw;
+    }
+    out
 }
 
 fn banner(app: &App) {
@@ -1188,5 +1270,61 @@ fn main() {
     if app.tui {
         print!("\x1b[?25h\x1b[?1049l");
         let _ = io::stdout().flush();
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn wrapped_lines_never_exceed_width() {
+        let text = "Glad to hear it! Is there a specific coding task or project you would like help with today? Let me know and I will take a look. 日本語のテキストも混ざる場合があります。";
+        for w in 16..=120 {
+            for line in wrap(text, w) {
+                assert!(disp_width_in(&line) <= w, "wrap({w}) produced {line:?}");
+            }
+        }
+    }
+
+
+    #[test]
+    fn frame_fits_small_windows() {
+        let app = App {
+            client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            root: PathBuf::from("."),
+            max_rounds: 0,
+            tui: true,
+            round: 1,
+            history: vec![
+                ("user".to_string(), "hello there, can you explain how the wrapping works in this terminal user interface and why wide characters matter?".to_string()),
+                ("assistant".to_string(), "Sure. The frame is rebuilt on every keystroke and every line is pre-wrapped to the terminal width so that nothing soft-wraps or gets clipped at the right edge, including CJK text like 日本語のテキスト。".to_string()),
+                ("tool".to_string(), "web.search -> a fairly long tool result line that also needs to wrap cleanly without spilling over".to_string()),
+            ],
+            picking_model: false,
+            model_list: vec![],
+            model_cursor: 0,
+            picking_session: false,
+            session_list: vec![],
+            session_cursor: 0,
+            session_id: "t".to_string(),
+        };
+        for (cols, rows) in [(30usize, 10usize), (40, 12), (64, 24), (120, 40)] {
+            let frame = app.frame_with_size("/mo", 3, cols, rows);
+            let mut used = 0;
+            for line in frame.split('\n') {
+                assert!(disp_width_in(line) <= cols, "cols={cols}: {line:?}");
+                used += 1;
+            }
+            assert!(used <= rows, "cols={cols} used={used} rows={rows}");
+        }
+    }
+
+
+    #[test]
+    fn clip_plain_counts_display_columns() {
+        assert_eq!(clip_plain("abcdef", 3), "abc");
+        assert_eq!(disp_width_in(&clip_plain("日本語テキスト", 6)), 6);
+        assert_eq!(clip_plain("abc", 0), "");
     }
 }
