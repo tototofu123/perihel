@@ -1,0 +1,21 @@
+# perihel-cli tool grammar - adapted from perihel-v2/desktop/grammar/perihel-tools.gbnf
+# Passed to llama.cpp as a grammar sampler constraint: the model physically
+# cannot emit an unknown tool name or malformed arguments.
+# ASCII only on purpose (Windows console defaults to cp950 here).
+
+root      ::= "{" ws "\"tool\":" ws tool "," ws "\"args\":" ws args "}" ws
+
+tool      ::= "\"fs.list\"" | "\"fs.read\"" | "\"fs.write\"" | "\"fs.mkdir\"" | "\"fs.copy\"" | "\"run.cmd\"" | "\"run.test\"" | "\"reply.text\""
+
+args      ::= path-args | write-args | copy-args | cmd-args | text-args
+
+path-args ::= "{" ws "\"path\":" ws string ws "}"
+copy-args ::= "{" ws "\"src\":" ws string "," ws "\"dst\":" ws string ws "}"
+write-args ::= "{" ws "\"path\":" ws string "," ws "\"content\":" ws string ws "}"
+cmd-args  ::= "{" ws "\"command\":" ws string "," ws "\"args\":" ws "[" ws string-list ws "]" ws "}"
+text-args ::= "{" ws "\"text\":" ws string ws "}"
+
+string-list ::= string ( ws "," ws string )*
+
+string    ::= "\"" ( [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) )* "\""
+ws        ::= [ \t\n]*
