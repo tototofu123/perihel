@@ -5,15 +5,17 @@
 
 root      ::= "{" ws "\"tool\":" ws tool "," ws "\"args\":" ws args "}" ws
 
-tool      ::= "\"fs.list\"" | "\"fs.read\"" | "\"fs.write\"" | "\"fs.mkdir\"" | "\"fs.copy\"" | "\"run.cmd\"" | "\"run.test\"" | "\"reply.text\""
+tool      ::= "\"fs.list\"" | "\"fs.read\"" | "\"fs.write\"" | "\"fs.mkdir\"" | "\"fs.copy\"" | "\"run.cmd\"" | "\"run.test\"" | "\"web.search\"" | "\"web.fetch\"" | "\"reply.text\""
 
-args      ::= path-args | write-args | copy-args | cmd-args | text-args
+args      ::= path-args | write-args | copy-args | cmd-args | text-args | query-args | url-args
 
 path-args ::= "{" ws "\"path\":" ws string ws "}"
 copy-args ::= "{" ws "\"src\":" ws string "," ws "\"dst\":" ws string ws "}"
 write-args ::= "{" ws "\"path\":" ws string "," ws "\"content\":" ws string ws "}"
 cmd-args  ::= "{" ws "\"command\":" ws string "," ws "\"args\":" ws "[" ws string-list ws "]" ws "}"
 text-args ::= "{" ws "\"text\":" ws string ws "}"
+query-args ::= "{" ws "\"query\":" ws string ws "}"
+url-args ::= "{" ws "\"url\":" ws string ws "}"
 
 string-list ::= string ( ws "," ws string )*
 
