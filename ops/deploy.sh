@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# perihel-v2 deploy — one-command deploy of the sync server to the GCP VM.
+# perihel deploy — one-command deploy of the sync server to the GCP VM.
 #
-# Copies server/sync-server/*.py and the systemd units to the VM, restarts
+# Copies vm/*.py and the systemd units to the VM, restarts
 # perihel-sync (and perihel-telegram if it is enabled), smoke-tests
 # GET /v1/health, and reports the AI queue depth.
 #
@@ -15,7 +15,7 @@
 #
 # Safety:
 # - Refuses to run with uncommitted changes to the files it deploys
-#   (server/sync-server/*.py, server/systemd/*), so a deploy always
+#   (vm/*.py, vm/systemd/*), so a deploy always
 #   matches a committed tree. --allow-dirty overrides (prints a warning).
 # - Copies only code and units. It never copies, reads, or prints a
 #   secret file (token, nim.key, nim.*.key, telegram.key, ntfy-topic).
@@ -43,7 +43,7 @@ usage() {
 Usage: ops/deploy.sh [--instance NAME] [--zone ZONE] [--project PROJECT]
                      [--dry-run] [--allow-dirty]
 
-Deploy the sync server (server/sync-server/*.py + server/systemd/*)
+Deploy the sync server (vm/*.py + vm/systemd/*)
 to the GCP VM, restart perihel-sync (and perihel-telegram if enabled),
 smoke-test GET /v1/health, and report the AI queue depth.
 
@@ -112,14 +112,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$REPO_ROOT" ] \
-    || die "not inside a git checkout — run from the perihel-v2 repo"
+    || die "not inside a git checkout — run from the perihel repo"
 
 # The deploy must match a committed tree: refuse on uncommitted changes
 # to exactly the files being deployed (code + units). Untracked files
 # that are not deployed (e.g. __pycache__/) do not match these pathspecs
 # and do not block a deploy.
 if [ "$ALLOW_DIRTY" = 0 ]; then
-    dirty="$(git status --porcelain -- 'server/sync-server/*.py' 'server/systemd' || true)"
+    dirty="$(git status --porcelain -- 'vm/*.py' 'vm/systemd' || true)"
     if [ -n "$dirty" ]; then
         echo "deploy: refusing — uncommitted changes to files being deployed:" >&2
         echo "$dirty" >&2
@@ -132,14 +132,14 @@ fi
 
 # Never ship a syntax error to the VM: compile everything first.
 # This is a local check, so it runs for real even in --dry-run mode.
-say "py_compile server/sync-server/*.py"
-[ "$DRY_RUN" = 1 ] && echo "[dry-run] (local check, runs now) python3 -m py_compile server/sync-server/*.py"
-python3 -m py_compile server/sync-server/*.py
+say "py_compile vm/*.py"
+[ "$DRY_RUN" = 1 ] && echo "[dry-run] (local check, runs now) python3 -m py_compile vm/*.py"
+python3 -m py_compile vm/*.py
 
-py_files=(server/sync-server/*.py)
-unit_files=(server/systemd/*.service server/systemd/*.timer)
-[ -f "${py_files[0]}" ] || die "no server/sync-server/*.py files found"
-[ -f "${unit_files[0]}" ] || die "no server/systemd unit files found"
+py_files=(vm/*.py)
+unit_files=(vm/systemd/*.service vm/systemd/*.timer)
+[ -f "${py_files[0]}" ] || die "no vm/*.py files found"
+[ -f "${unit_files[0]}" ] || die "no vm/systemd unit files found"
 
 if [ "$DRY_RUN" = 0 ]; then
     command -v gcloud >/dev/null 2>&1 || die "gcloud not found on PATH"

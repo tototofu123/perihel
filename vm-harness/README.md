@@ -7,7 +7,7 @@ systemd units/timers, their model drop-ins, and the helper scripts that
 only exist on the VM.
 
 The app code itself (`server.py`, `ai.py`, `digest.py`, …) lives in
-`server/sync-server/` and is deployed by `ops/deploy.sh`. This folder
+`vm/` and is deployed by `ops/deploy.sh`. This folder
 does **not** duplicate it — except for `tick.py` (see drift note 2).
 
 ## Contents
@@ -54,13 +54,13 @@ secret value.
 ## Drift vs the rest of the repo (read before changing either side)
 
 1. **`perihel-ntfy.service` runs `tick.py` on the VM, but
-   `server/systemd/perihel-ntfy.service` still points at
+   `vm/systemd/perihel-ntfy.service` still points at
    `ntfy_push.py`.** `ops/deploy.sh` even documents this ("nothing on
    the VM runs tick.py today", issue #10) — that claim is now out of
    date: the live unit was switched to `tick.py` outside of deploy.sh.
    The copy in this folder is the live one.
 2. **Live `tick.py` has a `check_budget_fallback()` step that
-   `server/sync-server/tick.py` does not.** The repo copy is behind
+   `vm/tick.py` does not.** The repo copy is behind
    live; updating it (and the deploy script) is follow-up work, not
    part of this snapshot.
 3. **The VM's deployed `ai.py` predates main.** PR #39 (Gemini

@@ -1,20 +1,34 @@
 # Perihel
 
-_A capture companion that understands your thoughts — desktop app, Android
-app, and a tiny self-hosted AI server. Everything runs on free tiers; your
-data lives on your own VM._
+_Perihel is a monorepo of small, self-hosted tools built around one idea: your
+machine and your data stay yours._
+
+- A **capture companion** that understands your thoughts — desktop app, Android
+  app, and a tiny self-hosted AI server. Everything runs on free tiers; your
+  data lives on your own VM.
+- Two **local coding-agent harnesses** that drive llama.cpp with constrained
+  tool calling: one on your desktop (`local-harness`), one on the VM
+  (`vm-harness`).
 
 ```
-desktop/   Rust workspace — egui app, hold-RightCtrl dictation (sherpa-onnx),
-           local/remote LLM copilot, capture resurfacing
-mobile/    Kotlin + Compose Android app — AI chat capture, filterable
-           logbook, alerts
-server/    Python sync server + AI processor (NVIDIA NIM tool calling,
-           long-term memory, reminders), Caddy TLS, systemd units
-ops/       budget kill-switch Cloud Function (auto-stops the VM if the
-           cloud bill ever crosses HK$0.01)
-docs/      SELF-HOST.md — rebuild the whole stack from scratch, $0/month
+local-agent/     Rust egui capture companion - dictation (sherpa-onnx), local
+                 llama.cpp copilot, capture resurfacing
+local-harness/   Rust CLI/TUI coding agent - llama.cpp + GBNF-constrained tool
+                 calls, web search/fetch, sessions
+vm/              Python sync server + AI processor (NVIDIA NIM tool calling,
+                 long-term memory, reminders), Caddy TLS, systemd units
+vm-harness/      systemd units + scripts that keep the agent loop alive on the VM
+mobile/          Kotlin + Compose Android app - AI chat capture, filterable
+                 logbook, alerts
+ops/             budget kill-switch Cloud Function (auto-stops the VM when the
+                 bill crosses HK$0.01)
+docs/            SELF-HOST.md - rebuild the whole stack from scratch, $0/month
 ```
+
+These are independent components that happen to share one repository: the
+capture product (`local-agent`, `mobile`, `vm`) and the two harnesses
+(`local-harness` runs on your machine, `vm-harness` runs on the server). Each
+folder has its own README and its own build.
 
 ## How it works
 
@@ -35,9 +49,13 @@ You send a thought — on the phone's chat, or `Ctrl+Shift+P` on the desktop:
 
 ## Stack
 
-- **Desktop** — Rust, egui, sherpa-onnx (on-device STT), llama.cpp sidecar
+- **Local agent** — Rust, egui, sherpa-onnx (on-device STT), llama.cpp sidecar
   for the offline copilot, NVIDIA NIM (free API) for the cloud copilot.
-- **Server** — Python stdlib only (no pip on the VM): HTTPS via Caddy +
+- **Local harness** — Rust single binary on top of llama.cpp's
+  OpenAI-compatible endpoint. Tool calls are forced by an embedded GBNF
+  grammar (no native tool API), so the sampler cannot emit a malformed call.
+  Full-screen TUI, `/` command menu, session browser, web search/fetch.
+- **VM** — Python stdlib only (no pip on the VM): HTTPS via Caddy +
   Let's Encrypt, bearer-token auth, SQLite. AI via NVIDIA NIM's
   OpenAI-compatible API with tool calls; a rate limiter and retry-once
   policy protect the free tier.
@@ -47,7 +65,20 @@ You send a thought — on the phone's chat, or `Ctrl+Shift+P` on the desktop:
 
 ## Quick start
 
-**Desktop** — see `desktop/README.md`.
+**Local agent** — see `local-agent/README.md`.
+
+**Local harness** — needs a llama.cpp server on `http://127.0.0.1:8090`:
+
+```powershell
+cd local-harness
+cargo build --release
+Copy-Item .\target\release\perihel-rs.exe "$env:USERPROFILE\.cargo\bin\perihel.exe"
+perihel                     # full-screen TUI (default)
+perihel --cli               # plain line-oriented CLI
+```
+
+**VM** — `docs/SELF-HOST.md` walks through the whole free-tier build, and
+`ops/deploy.sh` ships `vm/*.py` plus `vm/systemd/*` to the server.
 
 **Mobile** — needs the Android SDK:
 

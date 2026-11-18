@@ -1,25 +1,25 @@
 # Perihel monorepo — gitignore
 
-# --- desktop (Rust workspace) ---
-/desktop/target
-/desktop/.merge-tmp
+# --- local-agent (Rust workspace) ---
+/local-agent/target
+/local-agent/.merge-tmp
 
 # Model weights + the sherpa-onnx runtime are fetched by
-# desktop/scripts/download-models.ps1, never committed (hundreds of MB).
-/desktop/models/bin/
-/desktop/models/lib/
-desktop/models/**/*.gguf
-desktop/models/**/*.onnx
-desktop/models/**/*.bin
-desktop/models/**/*.ggml
-desktop/models/**/*.tar.bz2
-desktop/models/**/*.zip
-desktop/models/**/*.exe
-desktop/models/**/*.dll
-desktop/training/.venv
-desktop/training/base
-desktop/training/out
-desktop/training/llama.cpp
+# local-agent/scripts/download-models.ps1, never committed (hundreds of MB).
+/local-agent/models/bin/
+/local-agent/models/lib/
+local-agent/models/**/*.gguf
+local-agent/models/**/*.onnx
+local-agent/models/**/*.bin
+local-agent/models/**/*.ggml
+local-agent/models/**/*.tar.bz2
+local-agent/models/**/*.zip
+local-agent/models/**/*.exe
+local-agent/models/**/*.dll
+local-agent/training/.venv
+local-agent/training/base
+local-agent/training/out
+local-agent/training/llama.cpp
 
 # --- server (VM) ---
 # Your real VM address/token/topic live here — never committed.

@@ -70,7 +70,7 @@ ops/deploy.sh                 # deploy, restart, health-check, queue depth
 ops/deploy.sh --dry-run       # print every command without running any
 ```
 
-It copies `server/sync-server/*.py` and `server/systemd/*` to the VM,
+It copies `vm/*.py` and `vm/systemd/*` to the VM,
 restarts `perihel-sync` (and `perihel-telegram` if it is enabled),
 smoke-tests `GET /v1/health` (retried up to 6 times, 5 s apart), and
 reports the AI queue depth (captures with `ai_state='queued'`). It
@@ -88,7 +88,7 @@ On the VM (`gcloud compute ssh perihel-sync --zone=us-west1-b`):
 
 ```bash
 sudo mkdir -p /opt/perihel-sync && cd /opt/perihel-sync
-sudo cp ~/server.py ~/ai.py ~/tick.py ~/telegram_bot.py ~/search.py ~/digest.py .   # from server/sync-server/ in this repo
+sudo cp ~/server.py ~/ai.py ~/tick.py ~/telegram_bot.py ~/search.py ~/digest.py .   # from vm/ in this repo
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 \
   -nodes -subj "/CN=perihel-sync" -addext "subjectAltName=IP:YOUR_VM_IP"
 openssl rand -hex 32 | sudo tee token           # bearer token — the password
@@ -98,7 +98,7 @@ cat > nim.key   # paste key, then: chmod 600 nim.key
 sudo chmod 600 key.pem token ntfy-topic
 ```
 
-Install systemd units (see `server/systemd/`), then Caddy terminates real TLS:
+Install systemd units (see `vm/systemd/`), then Caddy terminates real TLS:
 
 ```bash
 sudo apt-get install -y caddy
@@ -125,7 +125,7 @@ Also add a monitoring email channel to the budget for the alert email.
 
 ## 6. Telegram bot (Perihel in the agent bus group)
 
-`server/sync-server/telegram_bot.py` long-polls Telegram and answers each
+`vm/telegram_bot.py` long-polls Telegram and answers each
 message by posting it to the local server's `/v1/chat` (which saves the
 capture and runs the AI), then replies in the originating chat only.
 Reminders due also go to Telegram, alongside ntfy (`tick.py`).
@@ -137,7 +137,7 @@ On the VM:
 # 2. Save it the same way as the other secrets:
 cat > /opt/perihel-sync/telegram.key   # paste the token
 sudo chmod 600 /opt/perihel-sync/telegram.key
-# 3. Enable the service (unit in server/systemd/):
+# 3. Enable the service (unit in vm/systemd/):
 sudo systemctl enable --now perihel-telegram
 ```
 
@@ -162,7 +162,7 @@ bot's calls — see §8.
 
 ## 7. Web search + fetch (/v1/search)
 
-`server/sync-server/search.py` is a stdlib-only search/fetch worker the
+`vm/search.py` is a stdlib-only search/fetch worker the
 Telegram bot and the daily digest consume over HTTP. It adds one endpoint:
 
 - `POST /v1/search {"query": "..."}` → `{"results": [{title, url, snippet}]}`
@@ -240,7 +240,7 @@ naming the files it looked for.
 
 ## 9. Daily digest (morning, via Telegram)
 
-`server/sync-server/digest.py` builds the morning digest — three
+`vm/digest.py` builds the morning digest — three
 sections — and sends it to every Telegram chat the bot has seen:
 
 1. **AI news** — the search worker (§7) for "artificial intelligence
@@ -253,14 +253,14 @@ sections — and sends it to every Telegram chat the bot has seen:
    note that `plans.md` is missing.
 
 Defaults (changeable): the repos are `tototofu123/agent-bus`,
-`tototofu123/perihel-v2`, and `HKUST-Climbing-Society/hkust-climbing-app`;
+`tototofu123/perihel`, and `HKUST-Climbing-Society/hkust-climbing-app`;
 the plans source is `plans.md`; the time is **08:00 VM-local time**.
 Change the repos with the `PERIHEL_DIGEST_REPOS` env var
 (comma-separated `owner/repo`, set it in the digest unit):
 
 ```ini
 # in perihel-digest.service [Service]:
-Environment=PERIHEL_DIGEST_REPOS=tototofu123/agent-bus,tototofu123/perihel-v2
+Environment=PERIHEL_DIGEST_REPOS=tototofu123/agent-bus,tototofu123/perihel
 ```
 
 GitHub access: no token is needed for public repos — unauthenticated
@@ -273,7 +273,7 @@ repo shows as "unreachable" in the digest instead of failing it. The
 token is never printed or logged.
 
 Trigger: the digest runs on the VM itself, on a systemd timer
-(`server/systemd/perihel-digest.timer`, `OnCalendar=*-*-* 08:00:00`,
+(`vm/systemd/perihel-digest.timer`, `OnCalendar=*-*-* 08:00:00`,
 `Persistent=true` so a missed run fires on boot). The VM clock should
 be Asia/Hong_Kong so 08:00 means 08:00 HKT:
 
@@ -305,7 +305,7 @@ into ≤4000-char Telegram messages so it never hits the 4096-char cap.
 
 ## 10. Health watchdog (server + AI queue, every 10 min)
 
-`server/sync-server/watchdog.py` checks the server and the AI queue
+`vm/watchdog.py` checks the server and the AI queue
 and alerts when something is wrong — one alert per incident, never a
 repeat every 10 minutes.
 
@@ -340,7 +340,7 @@ recovery notice is sent ("was down for 1h 23m"). Priority is
 down > stuck > spike > ok, so a down server masks a stuck queue.
 
 Trigger: a systemd timer on the VM itself
-(`server/systemd/perihel-watchdog.timer`, `OnCalendar=*-*-* *:0/10:00`,
+(`vm/systemd/perihel-watchdog.timer`, `OnCalendar=*-*-* *:0/10:00`,
 `Persistent=true`):
 
 ```bash
