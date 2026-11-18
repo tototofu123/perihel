@@ -76,6 +76,10 @@ struct Cli {
     /// Plain line-oriented CLI instead of the full-screen harness UI.
     #[arg(long)]
     cli: bool,
+    /// Full-screen harness UI. This is the default; the flag is accepted for
+    /// backwards compatibility with the README and desktop shortcut.
+    #[arg(long, hide = true)]
+    tui: bool,
     /// Show the model's streamed reasoning (off by default; slow).
     #[arg(long)]
     thinking: bool,
@@ -660,11 +664,15 @@ struct App {
     session_list: Vec<(PathBuf, String)>,
     session_cursor: usize,
     session_id: String,
+    busy: bool,
+    /// Lines scrolled up from the bottom of the conversation.
+    scroll: usize,
 }
 
 impl App {
     fn add(&mut self, kind: &str, text: &str) {
         self.history.push((kind.to_string(), text.to_string()));
+        self.scroll = 0; // snap back to the newest line
         if self.tui { self.draw(""); }
     }
 
@@ -692,15 +700,14 @@ impl App {
         loop {
             round += 1;
             self.round = round;
+            if self.tui { self.draw(""); } else { println!("[round {}] thinking...", round); }
+            self.busy = true;
             if self.tui { self.draw(""); }
-            else { println!("[round {}] thinking...", round); }
-            if self.tui {
-                self.add("system", "generating... (Ctrl+C stops)");
-            }
             let raw = match self.client.chat(!self.tui) {
                 Ok(r) => r,
-                Err(e) => { self.add("error", &e); return; }
+                Err(e) => { self.busy = false; self.add("error", &e); return; }
             };
+            self.busy = false;
             let call = match parse_call(&raw) {
                 Some(c) => c,
                 None => {
@@ -793,7 +800,9 @@ impl App {
         // Reserve header, separators, status bar, input line and suggestions.
         let body_h = rows.saturating_sub(6 + extra).max(1);
         let mut out = String::new();
-        out.push_str("\x1b[H\x1b[2J");
+        // Autowrap off while drawing: every row is pre-wrapped, and a line that
+        // ends exactly at the edge must not push the rest of the frame down.
+        out.push_str("\x1b[?7l\x1b[0m\x1b[2J\x1b[H");
         let header = format!(" PERIHEL  local agent harness  model:{}  grammar:{}  tools:{}",
             &self.client.model, if self.client.grammar.is_some() {"ON"} else {"OFF"}, TOOLS.len());
         out.push_str(&format!("\x1b[48;5;24m\x1b[97m{}\x1b[0m\n", clip_plain(&header, cols.saturating_sub(1))));
@@ -811,12 +820,18 @@ impl App {
                 lines.push(format!("{}{}", if i == 0 { prefix } else { "  " }, seg));
             }
         }
-        let start = lines.len().saturating_sub(body_h);
-        for line in &lines[start..] {
-            out.push_str(line);
-            out.push_str("\x1b[2K\n"); // erase anything left over on this row
+        if self.busy {
+            lines.push("\x1b[33m*\x1b[0m generating... (Ctrl+C stops)".to_string());
         }
-        for _ in 0..body_h.saturating_sub(lines.len().saturating_sub(start)) {
+        let max_scroll = lines.len().saturating_sub(body_h);
+        let scroll = self.scroll.min(max_scroll);
+        let end = lines.len() - scroll;
+        let start = end.saturating_sub(body_h);
+        for line in &lines[start..end] {
+            out.push_str(line);
+            out.push_str("\x1b[0K\n"); // erase to end of line, keeping the text
+        }
+        for _ in 0..body_h.saturating_sub(end - start) {
             out.push_str("\x1b[2K\n");
         }
         out.push_str(&format!("{}\n", "-".repeat(cols.saturating_sub(1))));
@@ -824,13 +839,17 @@ impl App {
             out.push_str("\x1b[1m  commands\x1b[0m\n");
             for (name, desc) in suggestions {
                 let row = format!("  {name}  {desc}");
-                out.push_str(&format!("{}\x1b[2K\n", clip_plain(&row, cols)));
+                out.push_str(&format!("{}\x1b[0K\n", clip_plain(&row, cols)));
             }
-            out.push_str("\x1b[2m  Tab completes, Enter runs\x1b[0m\x1b[2K\n");
+            out.push_str("\x1b[2m  Tab completes, Enter runs\x1b[0m\x1b[0K\n");
         }
         let cap = if self.max_rounds == 0 { "inf".into() } else { self.max_rounds.to_string() };
         // Keep the status bar to one row: drop optional pieces on narrow terminals.
-        let mut bar = String::from(" Enter send | /model | /session | /thinking | /quit | Ctrl+C");
+        let mut bar = if scroll > 0 {
+            format!(" SCROLLED +{scroll} lines  PgDn: latest  PgUp: older")
+        } else {
+            String::from(" Enter send | /model | /session | /thinking | /quit | Ctrl+C")
+        };
         let round = format!(" | round {}/{}", self.round, cap);
         if disp_width_in(&bar) + disp_width_in(&round) + 2 <= cols { bar.push_str(&round); }
         if !self.client.last_stats.is_empty() {
@@ -856,6 +875,7 @@ impl App {
             }
         }
         if cidx >= end { out.push_str("\x1b[7m \x1b[0m"); }
+        out.push_str("\x1b[?7h");
         out
     }
 }
@@ -905,7 +925,8 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[derive(Debug)]
 enum Key {
-    Char(char, bool), Enter, Left, Right, Up, Down, Backspace, Delete, Home, End, Esc, Other,
+    Char(char, bool), Enter, Left, Right, Up, Down, Backspace, Delete, Home, End, Esc,
+    PageUp, PageDown, Other,
 }
 
 /// Read one key in raw mode. Raw mode is disabled again before returning, so
@@ -934,6 +955,8 @@ fn read_key() -> Key {
                 KeyCode::Home => Key::Home,
                 KeyCode::End => Key::End,
                 KeyCode::Esc => Key::Esc,
+                KeyCode::PageUp => Key::PageUp,
+                KeyCode::PageDown => Key::PageDown,
                 KeyCode::Char(c) => Key::Char(c, ctrl),
                 _ => Key::Other,
             };
@@ -1058,6 +1081,8 @@ fn main() {
         session_list: Vec::new(),
         session_cursor: 0,
         session_id: format!("session-{}", chrono_stamp()),
+        busy: false,
+        scroll: 0,
     };
 
     if app.tui {
@@ -1172,6 +1197,16 @@ fn main() {
                         Key::Right => cursor = next_boundary(&buf, cursor),
                         Key::Home => cursor = 0,
                         Key::End => cursor = buf.len(),
+                        Key::PageUp => {
+                            let (_, rows) = term_size();
+                            let step = rows.saturating_sub(8).max(1);
+                            app.scroll = (app.scroll + step).min(10_000);
+                        }
+                        Key::PageDown => {
+                            let (_, rows) = term_size();
+                            let step = rows.saturating_sub(8).max(1);
+                            app.scroll = app.scroll.saturating_sub(step);
+                        }
                         Key::Enter => break,
                         Key::Esc => { buf.clear(); cursor = 0; }
                         _ => {}
@@ -1308,6 +1343,8 @@ mod layout_tests {
             session_list: vec![],
             session_cursor: 0,
             session_id: "t".to_string(),
+            busy: false,
+            scroll: 0,
         };
         for (cols, rows) in [(30usize, 10usize), (40, 12), (64, 24), (120, 40)] {
             let frame = app.frame_with_size("/mo", 3, cols, rows);
@@ -1320,6 +1357,65 @@ mod layout_tests {
         }
     }
 
+
+    #[test]
+    fn body_text_is_never_erased() {
+        let app = App {
+            client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            root: PathBuf::from("."),
+            max_rounds: 0,
+            tui: true,
+            round: 1,
+            history: vec![("user".to_string(), "hello there".to_string())],
+            picking_model: false,
+            model_list: vec![],
+            model_cursor: 0,
+            picking_session: false,
+            session_list: vec![],
+            session_cursor: 0,
+            session_id: "t".to_string(),
+            busy: false,
+            scroll: 0,
+        };
+        let frame = app.frame_with_size("", 0, 64, 24);
+        let line = frame.lines().find(|l| l.contains("hello there"))
+            .expect("user message missing from frame");
+        // ESC[2K erases the whole row, including the text just written.
+        assert!(!line.contains("\x1b[2K"), "body line must not use erase-whole-line: {line:?}");
+        assert!(line.ends_with("\x1b[0K"), "body line must end with erase-to-EOL: {line:?}");
+    }
+
+    #[test]
+    fn scrolling_reaches_the_oldest_message() {
+        let history: Vec<(String, String)> = (0..40)
+            .map(|i| ("user".to_string(), format!("line {i}")))
+            .collect();
+        let mut app = App {
+            client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            root: PathBuf::from("."),
+            max_rounds: 0,
+            tui: true,
+            round: 1,
+            history,
+            picking_model: false,
+            model_list: vec![],
+            model_cursor: 0,
+            picking_session: false,
+            session_list: vec![],
+            session_cursor: 0,
+            session_id: "t".to_string(),
+            busy: false,
+            scroll: 0,
+        };
+        let newest = app.frame_with_size("", 0, 64, 24);
+        assert!(newest.contains("line 39"), "newest view should show the last line");
+        assert!(!newest.contains("SCROLLED"));
+
+        app.scroll = 10_000; // clamped to the top
+        let oldest = app.frame_with_size("", 0, 64, 24);
+        assert!(oldest.contains("line 0"), "scrolled view should reach the first line");
+        assert!(oldest.contains("SCROLLED"));
+    }
 
     #[test]
     fn clip_plain_counts_display_columns() {
