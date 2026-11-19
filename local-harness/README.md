@@ -76,6 +76,16 @@ the status bar shows `SCROLLED +N` while you are reading older messages.
 `--tui` is the default and is still accepted as a flag for the README and
 desktop shortcut.
 
+Assistant replies are rendered as **Markdown** instead of raw text: fenced code
+blocks get a dark background (`48;5;236`) and a small built-in highlighter
+(keywords, strings, comments, numbers, `diff` +/-) for rust, python, js/ts,
+json, shell and friends; inline code is amber (`38;5;222`), `**bold**` is bold,
+`*italic*` is italic, headings are bold blue, list items get a `-` indent, `>`
+quotes get a dim bar, and `[text](url)` keeps the text with a dim URL. Wrapping
+happens on the styled spans themselves, so every rendered row still fits the
+window at any width (covered at 40 and 64 columns). User, tool and error lines
+stay plain, and `--cli` output stays raw so it can be piped.
+
 ## How tool calling works
 
 llama.cpp has no native tool-call API, so `tools.gbnf` is embedded in the binary
