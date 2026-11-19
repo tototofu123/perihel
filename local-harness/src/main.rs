@@ -950,8 +950,8 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[derive(Debug)]
 enum Key {
-    Char(char, bool), Enter, Left, Right, Up, Down, Backspace, Delete, Home, End, Esc,
-    PageUp, PageDown, Other,
+    Char(char, bool), Enter, Left(bool), Right(bool), Up, Down, Backspace, BackspaceWord,
+    Delete, Home, End, Esc, PageUp, PageDown, Other,
 }
 
 /// Read one key in raw mode. Raw mode is disabled again before returning, so
@@ -969,12 +969,14 @@ fn read_key() -> Key {
         if let Ok(Event::Key(k)) = event::read() {
             if k.kind != KeyEventKind::Press { continue; }
             let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            let word = ctrl || k.modifiers.contains(KeyModifiers::ALT);
             let key = match k.code {
                 KeyCode::Enter => Key::Enter,
-                KeyCode::Left => Key::Left,
-                KeyCode::Right => Key::Right,
+                KeyCode::Left => Key::Left(word),
+                KeyCode::Right => Key::Right(word),
                 KeyCode::Up => Key::Up,
                 KeyCode::Down => Key::Down,
+                KeyCode::Backspace if ctrl => Key::BackspaceWord,
                 KeyCode::Backspace => Key::Backspace,
                 KeyCode::Delete => Key::Delete,
                 KeyCode::Home => Key::Home,
@@ -998,6 +1000,56 @@ fn prev_boundary(s: &str, pos: usize) -> usize {
 fn next_boundary(s: &str, pos: usize) -> usize {
     if pos >= s.len() { return s.len(); }
     s[pos..].char_indices().nth(1).map(|(i, _)| pos + i).unwrap_or(s.len())
+}
+
+fn is_space_at(s: &str, start: usize, end: usize) -> bool {
+    s[start..end].chars().all(char::is_whitespace)
+}
+
+/// Start of the word before `pos`, skipping the run of whitespace first.
+fn prev_word(s: &str, pos: usize) -> usize {
+    let mut i = pos.min(s.len());
+    while i > 0 {
+        let p = prev_boundary(s, i);
+        if is_space_at(s, p, i) { i = p } else { break }
+    }
+    while i > 0 {
+        let p = prev_boundary(s, i);
+        if is_space_at(s, p, i) { break }
+        i = p;
+    }
+    i
+}
+
+/// End of the word at or after `pos`, skipping leading whitespace.
+fn next_word(s: &str, pos: usize) -> usize {
+    let mut i = pos.min(s.len());
+    while i < s.len() {
+        let n = next_boundary(s, i);
+        if is_space_at(s, i, n) { i = n } else { break }
+    }
+    while i < s.len() {
+        let n = next_boundary(s, i);
+        if is_space_at(s, i, n) { break }
+        i = n;
+    }
+    i
+}
+
+/// Prompts typed during this session, oldest first. Up/Down walk it when the
+/// slash menu is not showing, like a shell.
+fn prompt_history() -> &'static Mutex<Vec<String>> {
+    static HISTORY: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    HISTORY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn remember_prompt(line: &str) {
+    let line = line.trim();
+    if line.is_empty() { return; }
+    let mut hist = prompt_history().lock().unwrap();
+    if hist.last().map(|last| last == line).unwrap_or(false) { return; }
+    hist.push(line.to_string());
+    if hist.len() > 200 { hist.remove(0); }
 }
 
 fn term_size() -> (usize, usize) {
@@ -1222,17 +1274,55 @@ fn main() {
                 // Full-screen line editor with a visible block cursor.
                 let mut buf = String::new();
                 let mut cursor = 0usize;
+                // Shell-style history walk: None means "editing a fresh line".
+                let mut hist_pos: Option<usize> = None;
+                let mut draft = String::new();
                 app.suggest_cursor = 0;
                 loop {
                     app.draw_cursor(&buf, cursor);
                     match read_key() {
                         Key::Char('c', true) => break 'outer,
                         Key::Down => {
-                            let n = command_matches(&buf).len().saturating_sub(1);
-                            app.suggest_cursor = (app.suggest_cursor + 1).min(n);
+                            let matches = command_matches(&buf);
+                            if matches.is_empty() {
+                                if let Some(i) = hist_pos {
+                                    let next = {
+                                        let hist = prompt_history().lock().unwrap();
+                                        if i + 1 < hist.len() { Some(hist[i + 1].clone()) } else { None }
+                                    };
+                                    match next {
+                                        Some(line) => { hist_pos = Some(i + 1); buf = line; }
+                                        None => { hist_pos = None; buf = draft.clone(); }
+                                    }
+                                    cursor = buf.len();
+                                }
+                            } else {
+                                let n = matches.len().saturating_sub(1);
+                                app.suggest_cursor = (app.suggest_cursor + 1).min(n);
+                            }
                         }
                         Key::Up => {
-                            app.suggest_cursor = app.suggest_cursor.saturating_sub(1);
+                            let matches = command_matches(&buf);
+                            if matches.is_empty() {
+                                let target = {
+                                    let hist = prompt_history().lock().unwrap();
+                                    match hist_pos {
+                                        None if !hist.is_empty() => Some(hist.len() - 1),
+                                        Some(0) => Some(0),
+                                        Some(i) => Some(i - 1),
+                                        None => None,
+                                    }
+                                    .map(|i| (i, hist[i].clone()))
+                                };
+                                if let Some((i, line)) = target {
+                                    if hist_pos.is_none() { draft = buf.clone(); }
+                                    hist_pos = Some(i);
+                                    buf = line;
+                                    cursor = buf.len();
+                                }
+                            } else {
+                                app.suggest_cursor = app.suggest_cursor.saturating_sub(1);
+                            }
                         }
                         Key::Char('\t', false) => {
                             let matches = command_matches(&buf);
@@ -1241,10 +1331,28 @@ fn main() {
                                 cursor = buf.len();
                             }
                         }
+                        Key::Char('w', true) | Key::BackspaceWord if cursor > 0 => {
+                            let start = prev_word(&buf, cursor);
+                            buf.replace_range(start..cursor, "");
+                            cursor = start;
+                            app.suggest_cursor = 0;
+                        }
+                        Key::Char('u', true) => {
+                            buf.replace_range(..cursor, "");
+                            cursor = 0;
+                            app.suggest_cursor = 0;
+                        }
+                        Key::Char('k', true) => {
+                            buf.truncate(cursor);
+                            app.suggest_cursor = 0;
+                        }
+                        Key::Char('a', true) => cursor = 0,
+                        Key::Char('e', true) => cursor = buf.len(),
                         Key::Char(ch, false) => {
                             buf.insert(cursor, ch);
                             cursor += ch.len_utf8();
                             app.suggest_cursor = 0;
+                            hist_pos = None;
                         }
                         Key::Backspace if cursor > 0 => {
                             cursor = prev_boundary(&buf, cursor);
@@ -1255,8 +1363,12 @@ fn main() {
                             buf.remove(cursor);
                             app.suggest_cursor = 0;
                         }
-                        Key::Left => cursor = prev_boundary(&buf, cursor),
-                        Key::Right => cursor = next_boundary(&buf, cursor),
+                        Key::Left(word) => {
+                            cursor = if word { prev_word(&buf, cursor) } else { prev_boundary(&buf, cursor) };
+                        }
+                        Key::Right(word) => {
+                            cursor = if word { next_word(&buf, cursor) } else { next_boundary(&buf, cursor) };
+                        }
                         Key::Home => cursor = 0,
                         Key::End => cursor = buf.len(),
                         Key::PageUp => {
@@ -1295,6 +1407,7 @@ fn main() {
 
             // Model picker: arrows/j-k move, digits jump, Enter selects, q cancels.
             if cmd.is_empty() { continue; }
+            remember_prompt(&cmd);
             if cmd.starts_with('/') {
                 let (verb, rest) = cmd[1..].split_once(' ').unwrap_or((&cmd[1..], ""));
                 match verb {
@@ -1458,6 +1571,25 @@ mod layout_tests {
                 assert!(disp_width_in(line) <= cols, "cols={cols}: {line:?}");
             }
         }
+    }
+
+    #[test]
+    fn word_motion_respects_boundaries() {
+        let s = "hello  world, again";
+        assert_eq!(next_word(s, 0), 5);
+        assert_eq!(next_word(s, 5), 13);
+        assert_eq!(next_word(s, s.len()), s.len());
+        assert_eq!(prev_word(s, s.len()), 14);
+        assert_eq!(prev_word(s, 13), 7);
+        assert_eq!(prev_word(s, 5), 0);
+        assert_eq!(prev_word(s, 0), 0);
+
+        // UTF-8: never split a codepoint when jumping words.
+        let cjk = "你好 世界";
+        assert_eq!(next_word(cjk, 0), 6);
+        assert_eq!(prev_word(cjk, cjk.len()), 7);
+        assert!(cjk.is_char_boundary(next_word(cjk, 0)));
+        assert!(cjk.is_char_boundary(prev_word(cjk, cjk.len())));
     }
 
     #[test]
