@@ -27,8 +27,8 @@ perihel --model my-model                  # choose a model at startup
 perihel --workspace C:\some\project       # sandbox root
 ```
 
-In-session commands: `/help`, `/model [name]`, `/session`, `/rounds <n>`,
-`/thinking on|off`, `/reset`, `/tools`, `/workspace`, `/quit`.
+In-session commands: `/help`, `/model [name]`, `/session`, `/memory`,
+`/rounds <n>`, `/thinking on|off`, `/reset`, `/tools`, `/workspace`, `/quit`.
 `/model` with **no argument lists available models** (from llama.cpp
 `/v1/models` plus local `.gguf` files). `/rounds 0` (the default) means
 **unlimited** — there is no 8-round cap; the model can keep checking syntax
@@ -100,6 +100,45 @@ expected. When the slash menu is closed, **Up**/**Down** walk the prompts you
 typed this session; editing a recalled line keeps it as your draft, and typing
 `/` brings the menu back.
 
+## Memory
+
+Two plain Markdown files are read at the start of **every turn** and appended to
+the system prompt:
+
+| Scope | File | Use it for |
+|---|---|---|
+| global | `~/.perihel/MEMORY.md` | durable facts and preferences true in every project |
+| local | `<workspace>/MEMORY.md` | build commands, conventions and quirks of this repo |
+
+The model can append notes itself with
+`{"tool":"memory.add","args":{"scope":"local","text":"..."}}` (or `"global"`),
+which writes a `- note` line under a heading and re-reads the file next turn.
+You can edit either file by hand, check it into the repo, or just ask the model
+to remember something. `/memory` prints both paths and their line counts.
+Memory is capped at 4,000 characters per file so it cannot crowd out the prompt.
+
+## Background commands and verification
+
+`run.cmd` waits for the command; for servers, watchers and anything long-lived
+use `run.bg`. It starts the process with stdin closed, `stdout`+`stderr` going
+to `<workspace>/.perihel/jobs/<id>.log`, and returns a job id. `run.logs` reads
+the tail of that log (with the job's running/exited state) so the model can see
+console messages such as tracebacks or `Serving HTTP on ...`, and `run.stop`
+kills the whole process tree. Python jobs get `PYTHONUNBUFFERED=1` so output
+appears immediately.
+
+Foreground commands are bounded too: output goes to a temp file (a full pipe
+buffer can no longer deadlock the harness) and after **120 s** the process tree
+is killed and the partial output plus a `[timeout]` line is returned instead of
+an opaque error. Set `PERIHEL_CMD_TIMEOUT` (seconds) to change it.
+
+Because the model can now start something, read its console, fetch
+`http://127.0.0.1:PORT` with `web.fetch`, and stop it again, the system prompt
+tells it to verify before answering: run the project's real check, read the
+console, fix failures, and say exactly what is unverified instead of claiming
+success. `web.fetch` accepts `http://127.0.0.1:*`, so a dev server can be
+smoke-tested end to end without leaving the machine.
+
 ## How tool calling works
 
 llama.cpp has no native tool-call API, so `tools.gbnf` is embedded in the binary
@@ -108,12 +147,20 @@ cannot emit an unknown tool or malformed arguments. One JSON tool call per turn;
 its result is fed back as a user message (Perihel `copilot.rs` pattern).
 
 Tools: `fs.list`, `fs.read`, `fs.write`, `fs.mkdir`, `fs.copy`, `run.cmd`,
-`run.test`, `web.search`, `web.fetch`, `reply.text`. All paths are
+`run.bg`, `run.logs`, `run.stop`, `run.test`, `web.search`, `web.fetch`,
+`memory.add`, `reply.text`. All paths are
 workspace-sandboxed, commands are
-allowlisted with no shell, 60 s timeout, bounded output. `web.search` uses
+allowlisted with no shell, bounded output, 120 s timeout (see above).
+`web.search` uses
 keyless Bing RSS (8 results, 5 s gap, 10/min) and `web.fetch` strips
 script/style/nav from a page (2 MB cap, 6k chars). `enable_thinking` is
 off to avoid the reasoning loops measured with Qwen3.5-4B.
+
+The allowlist covers the usual verification commands: `python script.py`,
+`python -m pytest|http.server|py_compile|json.tool`, `node`/`npm`/`npx`
+(`test`, `start`, `run <script>`, `build`, `tsc`, `vite`, `next`, ...), `cargo`
+(`build`, `test`, `check`, `clippy`, `fmt`, `run`), `go`, `dotnet`, `git`
+(read-only), `rg` and `pytest`.
 
 ## Desktop shortcuts
 
