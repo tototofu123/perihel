@@ -30,17 +30,32 @@ Tools:
 - {"tool":"fs.write","args":{"path":"a.txt","content":"..."}}  write a file (use \n escapes)
 - {"tool":"fs.mkdir","args":{"path":"new/dir"}}  create a directory
 - {"tool":"fs.copy","args":{"src":"a.bin","dst":"dir/a.bin"}}  copy a file
-- {"tool":"run.cmd","args":{"command":"python","args":["-m","pytest","-q"]}}  run an allowlisted command
+- {"tool":"run.cmd","args":{"command":"python","args":["-m","pytest","-q"]}}  run an allowlisted command and wait
+- {"tool":"run.bg","args":{"command":"python","args":["-u","-m","http.server","8000"]}}  start a long-running command in the background
+- {"tool":"run.logs","args":{"id":"j1"}}  read a background job's console output (stdout+stderr)
+- {"tool":"run.stop","args":{"id":"j1"}}  stop a background job
 - {"tool":"run.test","args":{"path":"tests/test_x.py"}}  run tests on one file
 - {"tool":"web.search","args":{"query":"latest news"}}  keyless web search (Bing RSS)
 - {"tool":"web.fetch","args":{"url":"https://example.com"}}  fetch a page as readable text
+- {"tool":"memory.add","args":{"scope":"local","text":"..."}}  append a note to MEMORY.md (scope: local|global)
 - {"tool":"reply.text","args":{"text":"..."}}  finish the turn
 Rules: one tool per reply; paths are relative to the workspace, no absolute paths or `..`;
-inspect before writing, verify after writing; never claim success you did not verify."#;
+inspect before writing, verify after writing; never claim success you did not verify.
+The Memory section below is your persistent notes file; trust it and keep it current.
+
+## Verify before you answer
+- After writing or changing code, run the project's real check (`run.test`, or `run.cmd` with
+  the project's test / lint / compile command) and read the output.
+- For servers, GUIs and watchers use `run.bg`, then `run.logs` to read the console messages
+  (exceptions, "listening on ..."), and `web.fetch http://127.0.0.1:PORT` to confirm the page
+  really serves. Use `run.stop` when done so no port is left hijacked.
+- If a check fails, fix it and check again. If you could not verify something, say exactly
+  what is unverified in `reply.text` instead of claiming it works."#;
 
 const TOOLS: &[&str] = &[
     "fs.list", "fs.read", "fs.write", "fs.mkdir", "fs.copy",
-    "run.cmd", "run.test", "web.search", "web.fetch", "reply.text",
+    "run.cmd", "run.bg", "run.logs", "run.stop", "run.test",
+    "web.search", "web.fetch", "memory.add", "reply.text",
 ];
 
 const COMMANDS: &[(&str, &str)] = &[
@@ -51,6 +66,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/rounds <n>", "set max tool rounds (0 = unlimited)"),
     ("/tools", "list available tools"),
     ("/workspace", "show the sandbox root"),
+    ("/memory", "show global and project memory files"),
     ("/reset", "clear the conversation"),
     ("/quit", "exit perihel"),
 ];
@@ -304,19 +320,44 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("missing string argument: {key}"))
 }
 
+fn argv_from(args: &Value) -> Result<Vec<String>, String> {
+    let prog = arg_str(args, "command")?.to_string();
+    let rest: Vec<String> = args.get("args").and_then(|v| v.as_array())
+        .ok_or("args must be a list of strings")?
+        .iter().map(|v| v.as_str().map(str::to_string).ok_or("bad arg"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut full = vec![prog];
+    full.extend(rest);
+    Ok(full)
+}
+
 fn allow_command(argv: &[String]) -> Result<(), String> {
     let prog = Path::new(&argv[0]).file_name().and_then(|s| s.to_str()).unwrap_or("");
     let rest = &argv[1..];
+    let first = rest.first().map(|s| s.as_str());
     let allowed = match prog {
-        "python" | "python3" => {
-            (rest.len() >= 2 && rest[0] == "-m" && rest[1] == "pytest")
-                || (rest.len() == 1 && rest[0].ends_with(".py"))
+        "python" | "python3" | "py" => {
+            // Leading -u/-B only affect buffering; strip them before checking.
+            let cleaned: Vec<&str> = rest.iter().map(|s| s.as_str())
+                .skip_while(|s| *s == "-u" || *s == "-B").collect();
+            let script = cleaned.len() == 1 && cleaned[0].ends_with(".py");
+            let module = cleaned.first().map(|s| *s == "-m").unwrap_or(false);
+            let pytest = module && cleaned.get(1) == Some(&"pytest");
+            let http = module && cleaned.get(1) == Some(&"http.server");
+            let json_tool = module && cleaned.get(1) == Some(&"json.tool");
+            let compile = module && cleaned.get(1) == Some(&"py_compile") && cleaned.len() == 3;
+            script || pytest || http || json_tool || compile
         }
         "node" => (rest.len() == 1 && rest[0].ends_with(".js"))
-            || (rest.len() >= 2 && rest[0] == "-e"),
-        "npm" => rest.first().map(|s| s == "test").unwrap_or(false),
-        "npx" => rest.len() >= 2 && rest[0] == "tsc" && rest[1] == "--noEmit",
-        "git" => matches!(rest.first().map(|s| s.as_str()), Some("status" | "diff" | "log"))
+            || (rest.len() >= 2 && rest[0] == "-e")
+            || (rest.len() >= 2 && rest[0] == "--test"),
+        "npm" => matches!(first, Some("test" | "start" | "run" | "build" | "ci" | "--version")),
+        "npx" => matches!(first, Some("tsc" | "vite" | "next" | "jest" | "eslint" | "prettier" | "serve")),
+        "cargo" => matches!(first,
+            Some("build" | "test" | "check" | "clippy" | "fmt" | "run" | "metadata" | "tree" | "--version")),
+        "go" => matches!(first, Some("build" | "test" | "run" | "vet" | "mod")),
+        "dotnet" => matches!(first, Some("build" | "test" | "run" | "watch")),
+        "git" => matches!(first, Some("status" | "diff" | "log"))
             || (rest.len() == 3 && rest[0] == "branch" && rest[1] == "--show-current"),
         "rg" | "pytest" => true,
         _ => false,
@@ -325,45 +366,257 @@ fn allow_command(argv: &[String]) -> Result<(), String> {
 }
 
 fn run_process(argv: &[String], cwd: &Path) -> Result<(bool, String), String> {
+    run_process_within(argv, cwd, cmd_timeout())
+}
+
+fn cmd_timeout() -> Duration {
+    let secs = std::env::var("PERIHEL_CMD_TIMEOUT").ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(120);
+    Duration::from_secs(secs)
+}
+
+/// Run to completion, capturing stdout+stderr to a file while we wait.
+///
+/// Pipes would deadlock as soon as a chatty command filled the 64 KB buffer,
+/// and a hung command would block the whole TUI, so output goes to a temp file
+/// and the waiter is bounded by `limit`. On timeout the whole process tree is
+/// killed and the partial output is returned instead of an opaque error.
+fn run_process_within(argv: &[String], cwd: &Path, limit: Duration) -> Result<(bool, String), String> {
     allow_command(argv)?;
-    let mut child = Command::new(&argv[0])
-        .args(&argv[1..])
+    let log = temp_log_path("cmd");
+    if let Some(parent) = log.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
         .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run {}: {e}", argv[0]))?;
-    let start = Instant::now();
+        .stdin(Stdio::null());
+    attach_log(&mut cmd, &log)?;
+    let mut child = cmd.spawn().map_err(|e| format!("cannot run {}: {e}", argv[0]))?;
+    let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let out = child.wait_with_output().map_err(|e| e.to_string())?;
-                let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-                text.push_str(&String::from_utf8_lossy(&out.stderr));
-                if text.len() > 6000 {
-                    text = text[text.len() - 6000..].to_string();
-                }
-                return Ok((status.success(), text));
+                let text = fs::read_to_string(&log).unwrap_or_default();
+                let _ = fs::remove_file(&log);
+                return Ok((status.success(), tail_chars(&text, 6000)));
             }
             Ok(None) => {
-                if start.elapsed() > Duration::from_secs(60) {
-                    let _ = child.kill();
-                    return Err("command timed out after 60s".into());
+                if started.elapsed() > limit {
+                    kill_tree(child.id());
+                    let _ = child.wait();
+                    let mut text = fs::read_to_string(&log).unwrap_or_default();
+                    let _ = fs::remove_file(&log);
+                    if !text.ends_with('\n') { text.push('\n'); }
+                    text.push_str(&format!(
+                        "[timeout] command exceeded {}s and was stopped (raise PERIHEL_CMD_TIMEOUT to wait longer)",
+                        limit.as_secs()));
+                    return Ok((false, tail_chars(&text, 6000)));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(e.to_string()),
+            Err(e) => {
+                let _ = fs::remove_file(&log);
+                return Err(e.to_string());
+            }
         }
     }
 }
 
+fn tail_chars(s: &str, max: usize) -> String {
+    if s.len() <= max { return s.to_string(); }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) { start += 1; }
+    format!("... [truncated]\n{}", &s[start..])
+}
+
+fn is_python(prog: &str) -> bool {
+    let name = Path::new(prog).file_name().and_then(|s| s.to_str()).unwrap_or("");
+    name == "python" || name == "python3" || name == "py"
+}
+
+fn attach_log(cmd: &mut Command, log: &Path) -> Result<(), String> {
+    let out = fs::File::create(log).map_err(|e| e.to_string())?;
+    let err = out.try_clone().map_err(|e| e.to_string())?;
+    cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
+    Ok(())
+}
+
+fn temp_log_path(kind: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    std::env::temp_dir()
+        .join("perihel")
+        .join(format!("{kind}-{}-{n}.log", std::process::id()))
+}
+
+fn kill_tree(pid: u32) {
+    let pid_s = pid.to_string();
+    #[cfg(windows)]
+    {
+        // /T also stops children (npm -> node, python -> subprocess).
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid_s, "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill").args(["-9", &pid_s]).status();
+    }
+}
+
+// ------------------------------------------------------------- background jobs
+
+struct Job {
+    id: String,
+    command: String,
+    log: PathBuf,
+    child: std::process::Child,
+}
+
+fn jobs() -> &'static Mutex<Vec<Job>> {
+    static JOBS: OnceLock<Mutex<Vec<Job>>> = OnceLock::new();
+    JOBS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn jobs_dir(root: &Path) -> PathBuf { root.join(".perihel").join("jobs") }
+
+fn start_background(argv: &[String], root: &Path) -> Result<String, String> {
+    allow_command(argv)?;
+    let dir = jobs_dir(root);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    let id = format!("j{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+    let log = dir.join(format!("{id}.log"));
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]).current_dir(root).stdin(Stdio::null());
+    if is_python(&argv[0]) { cmd.env("PYTHONUNBUFFERED", "1"); }
+    attach_log(&mut cmd, &log)?;
+    let child = cmd.spawn().map_err(|e| format!("cannot start {}: {e}", argv[0]))?;
+    let pid = child.id();
+    let command = argv.join(" ");
+    jobs().lock().unwrap().push(Job { id: id.clone(), command, log: log.clone(), child });
+    Ok(format!(
+        "job {id} started (pid {pid})\nlog: {}\nread console output with {{\"tool\":\"run.logs\",\"args\":{{\"id\":\"{id}\"}}}}; stop it with run.stop",
+        log.display()))
+}
+
+fn job_logs(id: &str) -> Result<String, String> {
+    let mut guard = jobs().lock().unwrap();
+    let job = guard.iter_mut().find(|j| j.id == id)
+        .ok_or_else(|| format!("unknown job: {id} (jobs live only for this process)"))?;
+    let state = match job.child.try_wait() {
+        Ok(Some(status)) => format!("exited with {}", status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())),
+        Ok(None) => "running".to_string(),
+        Err(e) => format!("state unknown: {e}"),
+    };
+    let text = fs::read_to_string(&job.log).unwrap_or_default();
+    let body = if text.trim().is_empty() { "(no output yet - the process may still be starting)".to_string() }
+               else { tail_chars(&text, 6000) };
+    Ok(format!("job {id}: {} | {}\nlog: {}\n{body}", job.command, state, job.log.display()))
+}
+
+fn stop_job(id: &str) -> Result<String, String> {
+    let mut guard = jobs().lock().unwrap();
+    let job = guard.iter_mut().find(|j| j.id == id)
+        .ok_or_else(|| format!("unknown job: {id}"))?;
+    match job.child.try_wait() {
+        Ok(Some(status)) => Ok(format!("job {id} already stopped ({:?})", status.code())),
+        _ => {
+            kill_tree(job.child.id());
+            let _ = job.child.wait();
+            Ok(format!("job {id} stopped"))
+        }
+    }
+}
+
+
 // ------------------------------------------------------------------ sessions
+
+fn perihel_home() -> PathBuf {
+    if let Ok(p) = std::env::var("PERIHEL_HOME") { return PathBuf::from(p); }
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".perihel")
+}
 
 fn sessions_dir() -> PathBuf {
     if let Ok(p) = std::env::var("PERIHEL_SESSIONS_DIR") { return PathBuf::from(p); }
-    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".perihel").join("sessions")
+    perihel_home().join("sessions")
+}
+
+// ------------------------------------------------------------------- memory
+
+/// Notes that follow you between projects.
+fn global_memory_path() -> PathBuf { perihel_home().join("MEMORY.md") }
+
+/// Notes about this workspace, checked in next to the code.
+fn local_memory_path(root: &Path) -> PathBuf { root.join("MEMORY.md") }
+
+const MEMORY_LIMIT: usize = 4000;
+
+fn read_memory(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let text = text.trim().to_string();
+    if text.is_empty() { return None; }
+    Some(truncate_chars(&text, MEMORY_LIMIT))
+}
+
+fn memory_block(root: &Path) -> String {
+    let global = global_memory_path();
+    let local = local_memory_path(root);
+    let mut out = String::from("\n\n## Memory\n");
+    out.push_str(&format!("\n### Global memory ({})\n", global.display()));
+    out.push_str(&read_memory(&global).unwrap_or_else(|| "(empty)".into()));
+    out.push_str(&format!("\n\n### Project memory ({})\n", local.display()));
+    out.push_str(&read_memory(&local).unwrap_or_else(|| "(empty)".into()));
+    out.push_str("\n\nUse {\"tool\":\"memory.add\",\"args\":{\"scope\":\"local\",\"text\":\"...\"}} \
+to keep a durable fact or a project rule; use scope \"global\" for things true in every project. \
+Memory is re-read at the start of every turn.\n");
+    out
+}
+
+fn system_with_memory(root: &Path) -> String {
+    format!("{}{}", DEFAULT_SYSTEM, memory_block(root))
+}
+
+fn refresh_system(client: &mut Client, root: &Path) {
+    let sys = system_with_memory(root);
+    if client.messages.is_empty() {
+        client.messages.push(json!({"role": "system", "content": sys}));
+    } else {
+        client.messages[0] = json!({"role": "system", "content": sys});
+    }
+}
+
+fn memory_add(root: &Path, scope: &str, text: &str) -> Result<String, String> {
+    memory_add_at(&perihel_home(), root, scope, text)
+}
+
+fn memory_add_at(home: &Path, root: &Path, scope: &str, text: &str) -> Result<String, String> {
+    let path = match scope {
+        "global" => home.join("MEMORY.md"),
+        "local" => local_memory_path(root),
+        _ => return Err("scope must be \"global\" or \"local\"".into()),
+    };
+    let note = text.lines().map(str::trim).filter(|l| !l.is_empty())
+        .collect::<Vec<_>>().join(" ");
+    if note.is_empty() { return Err("text is empty".into()); }
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let mut body = fs::read_to_string(&path).unwrap_or_default();
+    if body.trim().is_empty() {
+        body = if scope == "global" {
+            "# Global memory\n\nDurable facts and preferences that apply in every project.\n".to_string()
+        } else {
+            "# Project memory\n\nFacts, commands and rules for this workspace.\n".to_string()
+        };
+    }
+    if !body.ends_with('\n') { body.push('\n'); }
+    body.push_str(&format!("- {note}\n"));
+    fs::write(&path, body).map_err(|e| e.to_string())?;
+    Ok(format!("remembered ({scope}) -> {}\ntakes effect on the next turn", path.display()))
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -628,15 +881,24 @@ fn execute(call: &Value, root: &Path) -> ToolResult {
             Ok(ToolResult { ok: true, output: format!("copied {n} bytes -> {}", dst.display()), refused: None })
         })()),
         "run.cmd" => wrap((|| {
-            let prog = arg_str(args, "command")?.to_string();
-            let argv: Vec<String> = args.get("args").and_then(|v| v.as_array())
-                .ok_or("args must be a list of strings")?
-                .iter().map(|v| v.as_str().map(str::to_string).ok_or("bad arg"))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut full = vec![prog];
-            full.extend(argv);
+            let full = argv_from(args)?;
             let (ok, out) = run_process(&full, root)?;
             Ok(ToolResult { ok, output: out, refused: None })
+        })()),
+        "run.bg" => wrap((|| {
+            let full = argv_from(args)?;
+            let msg = start_background(&full, root)?;
+            Ok(ToolResult { ok: true, output: msg, refused: None })
+        })()),
+        "run.logs" => wrap((|| {
+            let id = arg_str(args, "id")?;
+            let msg = job_logs(id)?;
+            Ok(ToolResult { ok: true, output: msg, refused: None })
+        })()),
+        "run.stop" => wrap((|| {
+            let id = arg_str(args, "id")?;
+            let msg = stop_job(id)?;
+            Ok(ToolResult { ok: true, output: msg, refused: None })
         })()),
         "run.test" => wrap((|| {
             let p = safe_path(root, arg_str(args, "path")?)?;
@@ -652,6 +914,12 @@ fn execute(call: &Value, root: &Path) -> ToolResult {
         "web.fetch" => wrap((|| {
             let r = web_fetch(args);
             Ok(r)
+        })()),
+        "memory.add" => wrap((|| {
+            let scope = arg_str(args, "scope")?;
+            let text = arg_str(args, "text")?;
+            let msg = memory_add(root, scope, text)?;
+            Ok(ToolResult { ok: true, output: msg, refused: None })
         })()),
         _ => ToolResult { ok: false, output: String::new(), refused: Some(format!("unknown tool: {name}")) },
     }
@@ -716,6 +984,8 @@ impl App {
     }
 
     fn run_turn(&mut self, user: &str) {
+        // Pick up MEMORY.md edits and notes added by the previous turn.
+        refresh_system(&mut self.client, &self.root);
         self.client.messages.push(json!({"role":"user","content":user}));
         self.add("user", user);
         let mut round = 0;
@@ -1418,7 +1688,7 @@ fn main() {
                 let (verb, rest) = cmd[1..].split_once(' ').unwrap_or((&cmd[1..], ""));
                 match verb {
                     "quit" | "exit" => break,
-                    "help" => app.inform("/help /quit /reset /model [name] /rounds <n> /thinking on|off /tools /workspace"),
+                    "help" => app.inform("/help /quit /reset /model [name] /rounds <n> /thinking on|off /tools /workspace /memory"),
                     "reset" => {
                         app.client.reset();
                         app.history.clear();
@@ -1482,6 +1752,13 @@ fn main() {
                     }
                     "tools" => app.inform(&TOOLS.join(", ")),
                     "workspace" => app.inform(&app.root.display().to_string()),
+                    "memory" => {
+                        for (label, p) in [("global", global_memory_path()), ("local", local_memory_path(&app.root))] {
+                            let lines = fs::read_to_string(&p).map(|t| t.lines().count()).unwrap_or(0);
+                            let state = if p.exists() { "exists" } else { "not created yet" };
+                            app.inform(&format!("{label}: {} ({lines} lines, {state})", p.display()));
+                        }
+                    }
                     _ => app.inform(&format!("unknown command: {verb}")),
                 }
                 continue;
@@ -1494,6 +1771,90 @@ fn main() {
     if app.tui {
         print!("\x1b[?25h\x1b[?1049l");
         let _ = io::stdout().flush();
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+
+    fn python_available() -> bool {
+        Command::new("python").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("perihel-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn allowlist_accepts_verification_commands() {
+        let ok = |v: &[&str]| allow_command(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(ok(&["cargo", "test"]).is_ok());
+        assert!(ok(&["cargo", "check", "--all-targets"]).is_ok());
+        assert!(ok(&["python", "-u", "app.py"]).is_ok());
+        assert!(ok(&["python", "-m", "http.server", "8000"]).is_ok());
+        assert!(ok(&["python", "-u", "-m", "http.server", "8000"]).is_ok());
+        assert!(ok(&["python", "-m", "pytest", "-q"]).is_ok());
+        assert!(ok(&["npm", "run", "dev"]).is_ok());
+        assert!(ok(&["npx", "vite"]).is_ok());
+        assert!(ok(&["go", "test", "./..."]).is_ok());
+        assert!(ok(&["git", "status"]).is_ok());
+        assert!(ok(&["rm", "-rf", "/"]).is_err());
+        assert!(ok(&["curl", "http://example.com"]).is_err());
+        assert!(ok(&["python", "-c", "import os"]).is_err());
+    }
+
+    #[test]
+    fn tail_chars_never_splits_utf8() {
+        let s = "日本語テキスト".repeat(30);
+        let t = tail_chars(&s, 10);
+        assert!(t.starts_with("... [truncated]\n"));
+        assert!(t.ends_with('ト'));
+        assert_eq!(tail_chars("short", 100), "short");
+    }
+
+    #[test]
+    fn long_command_is_stopped_and_partial_output_kept() {
+        if !python_available() { return; }
+        let dir = temp_dir("timeout");
+        fs::write(dir.join("sleepy.py"),
+            "import time\nprint('started', flush=True)\ntime.sleep(30)\nprint('done')\n").unwrap();
+        let argv = vec!["python".to_string(), "sleepy.py".to_string()];
+        let started = Instant::now();
+        let (ok, out) = run_process_within(&argv, &dir, Duration::from_millis(600)).unwrap();
+        assert!(!ok, "timed out command must report failure");
+        assert!(started.elapsed() < Duration::from_secs(10), "killed promptly");
+        assert!(out.contains("started"), "partial output kept: {out:?}");
+        assert!(out.contains("[timeout]"), "timeout explained: {out:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn background_job_streams_logs_and_stops() {
+        if !python_available() { return; }
+        let dir = temp_dir("jobs");
+        fs::write(dir.join("hello.py"),
+            "import time\nprint('bg-hello', flush=True)\ntime.sleep(30)\n").unwrap();
+        let argv = vec!["python".to_string(), "-u".to_string(), "hello.py".to_string()];
+        let started = start_background(&argv, &dir).unwrap();
+        let id = started.split_whitespace().nth(1).expect("job id").to_string();
+
+        let mut logs = String::new();
+        for _ in 0..60 {
+            logs = job_logs(&id).unwrap();
+            if logs.contains("bg-hello") { break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(logs.contains("bg-hello"), "console output captured: {logs:?}");
+        assert!(logs.contains("running"), "job state reported: {logs:?}");
+
+        assert!(stop_job(&id).unwrap().contains("stopped"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(job_logs(&id).unwrap().contains("exited"), "job is reaped");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
@@ -1627,6 +1988,33 @@ mod layout_tests {
         assert!(frame.contains("\x1b[38;5;222m"), "inline code colour missing");
         assert!(!assistant_part.contains("```"), "fences leaked into the frame");
         assert!(frame.contains("`quoted`"), "tool rows must stay raw");
+    }
+
+    #[test]
+    fn memory_files_are_created_and_read_back() {
+        let base = std::env::temp_dir().join(format!("perihel-mem-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let ws = base.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        memory_add_at(&home, &ws, "local", "always run cargo test").unwrap();
+        memory_add_at(&home, &ws, "local", "second\nnote").unwrap();
+        memory_add_at(&home, &ws, "global", "prefer ASCII output").unwrap();
+        assert!(memory_add_at(&home, &ws, "bogus", "x").is_err());
+
+        let local = fs::read_to_string(ws.join("MEMORY.md")).unwrap();
+        assert!(local.starts_with("# Project memory"));
+        assert!(local.contains("- always run cargo test"));
+        assert!(local.contains("- second note"), "multi-line notes are joined: {local:?}");
+
+        let global = fs::read_to_string(home.join("MEMORY.md")).unwrap();
+        assert!(global.starts_with("# Global memory"));
+        assert!(global.contains("- prefer ASCII output"));
+
+        assert_eq!(read_memory(&ws.join("MEMORY.md")).unwrap().matches("- ").count(), 2);
+        assert!(read_memory(&ws.join("missing.md")).is_none());
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
