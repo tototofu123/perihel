@@ -997,7 +997,14 @@ impl App {
             if self.tui { self.draw(""); }
             let raw = match self.client.chat(!self.tui) {
                 Ok(r) => r,
-                Err(e) => { self.busy = false; self.add("error", &e); return; }
+                Err(e) => {
+                    self.busy = false;
+                    // `add` only redraws in TUI mode; a CLI user would never
+                    // see the error (unreachable server, bad JSON, retry fail).
+                    if !self.tui { eprintln!("[error] {e}"); }
+                    self.add("error", &e);
+                    return;
+                }
             };
             self.busy = false;
             let call = match parse_call(&raw) {
