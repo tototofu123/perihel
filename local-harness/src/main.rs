@@ -17,6 +17,8 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+mod markdown;
+
 const GRAMMAR: &str = include_str!("../tools.gbnf");
 
 const DEFAULT_SYSTEM: &str = r#"You are Perihel, a careful local coding agent.
@@ -828,7 +830,12 @@ impl App {
                 "error" => "\x1b[31m!\x1b[0m ",
                 _ => "\x1b[34mi\x1b[0m ",
             };
-            for (i, seg) in wrap(text, cols.saturating_sub(3)).iter().enumerate() {
+            let body: Vec<String> = if kind == "assistant" {
+                markdown::render(text, cols.saturating_sub(3))
+            } else {
+                wrap(text, cols.saturating_sub(3))
+            };
+            for (i, seg) in body.iter().enumerate() {
                 lines.push(format!("{}{}", if i == 0 { prefix } else { "  " }, seg));
             }
         }
@@ -1006,7 +1013,7 @@ fn term_size() -> (usize, usize) {
 }
 
 /// Display columns used by a char (CJK and fullwidth forms take two).
-fn char_width(c: char) -> usize {
+pub(crate) fn char_width(c: char) -> usize {
     match c as u32 {
         0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF
         | 0x4E00..=0x9FFF | 0xA000..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF
@@ -1423,6 +1430,37 @@ mod layout_tests {
 
 
     #[test]
+    fn markdown_reply_fits_narrow_windows() {
+        let app = App {
+            client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            root: PathBuf::from("."),
+            max_rounds: 0,
+            tui: true,
+            round: 1,
+            history: vec![(
+                "assistant".to_string(),
+                "## Result\n\nReplaced `wrap()` with an **ANSI-aware** renderer.\n\n```rust\nfn main() {\n    let answer: u32 = 42; // keep going\n    println!(\"answer = {answer}\");\n}\n```\n\n- tests pass\n- one long bullet that must wrap rather than spill past the right edge of a narrow terminal\n\n> links: [docs](https://example.com/a/long/path)\n".to_string(),
+            )],
+            picking_model: false,
+            model_list: vec![],
+            model_cursor: 0,
+            picking_session: false,
+            session_list: vec![],
+            session_cursor: 0,
+            session_id: "t".to_string(),
+            busy: false,
+            scroll: 0,
+            suggest_cursor: 0,
+        };
+        for (cols, rows) in [(40usize, 30usize), (64, 30)] {
+            let frame = app.frame_with_size("", 0, cols, rows);
+            for line in frame.split('\n') {
+                assert!(disp_width_in(line) <= cols, "cols={cols}: {line:?}");
+            }
+        }
+    }
+
+    #[test]
     fn body_text_is_never_erased() {
         let app = App {
             client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
@@ -1485,7 +1523,7 @@ mod layout_tests {
 
     #[test]
     fn slash_menu_has_a_movable_pointer() {
-        let mut app = App {
+        let app = App {
             client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
             root: PathBuf::from("."),
             max_rounds: 0,
