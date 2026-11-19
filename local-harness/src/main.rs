@@ -1593,6 +1593,37 @@ mod layout_tests {
     }
 
     #[test]
+    fn assistant_rows_are_markdown_but_tool_rows_are_plain() {
+        let app = App {
+            client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            root: PathBuf::from("."),
+            max_rounds: 0,
+            tui: true,
+            round: 1,
+            history: vec![
+                ("assistant".to_string(), "Use `cargo test` and **ship** it.\n\n```\nlet x = 1;\n```".to_string()),
+                ("tool".to_string(), "web.search -> `quoted` and **stars** stay raw".to_string()),
+            ],
+            picking_model: false,
+            model_list: vec![],
+            model_cursor: 0,
+            picking_session: false,
+            session_list: vec![],
+            session_cursor: 0,
+            session_id: "t".to_string(),
+            busy: false,
+            scroll: 0,
+            suggest_cursor: 0,
+        };
+        let frame = app.frame_with_size("", 0, 64, 20);
+        let assistant_part: String = frame.lines().filter(|l| !l.contains("stay raw")).collect::<Vec<_>>().join("\n");
+        assert!(frame.contains("\x1b[48;5;236m"), "code block background missing");
+        assert!(frame.contains("\x1b[38;5;222m"), "inline code colour missing");
+        assert!(!assistant_part.contains("```"), "fences leaked into the frame");
+        assert!(frame.contains("`quoted`"), "tool rows must stay raw");
+    }
+
+    #[test]
     fn body_text_is_never_erased() {
         let app = App {
             client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
