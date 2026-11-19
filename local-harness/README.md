@@ -86,6 +86,14 @@ happens on the styled spans themselves, so every rendered row still fits the
 window at any width (covered at 40 and 64 columns). User, tool and error lines
 stay plain, and `--cli` output stays raw so it can be piped.
 
+The input line is a real line editor, not append-only: **Ctrl+W** deletes the
+word before the cursor, **Ctrl+U** clears to the start, **Ctrl+K** kills to the
+end, **Ctrl+A**/**Ctrl+E** jump to start/end, **Ctrl+Left/Right** (or
+**Alt+Left/Right**) move a word at a time, and Home/End/Delete behave as
+expected. When the slash menu is closed, **Up**/**Down** walk the prompts you
+typed this session; editing a recalled line keeps it as your draft, and typing
+`/` brings the menu back.
+
 ## How tool calling works
 
 llama.cpp has no native tool-call API, so `tools.gbnf` is embedded in the binary
