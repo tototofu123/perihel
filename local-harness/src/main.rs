@@ -12,7 +12,9 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -936,10 +938,212 @@ fn parse_call(text: &str) -> Option<Value> {
     Some(obj)
 }
 
+// ------------------------------------------------------------------ llama sidecar
+
+/// Owns llama-server for the lifetime of the harness. It is started on the
+/// first request (never at launch), kept loaded while the harness is open, and
+/// killed when the harness exits or the model changes.
+struct Sidecar {
+    child: Option<Child>,
+    owned: bool,                 // false when we adopted a server someone else started
+    model: String,
+    base: String,
+    port: String,
+    root: PathBuf,
+    probe: ureq::Agent,
+}
+
+impl Sidecar {
+    fn new(base: &str, root: &Path) -> Self {
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(2)))
+            .build();
+        Self {
+            child: None,
+            owned: false,
+            model: String::new(),
+            base: base.trim_end_matches('/').to_string(),
+            port: base.rsplit(':').next().unwrap_or("8090").to_string(),
+            root: root.to_path_buf(),
+            probe: ureq::Agent::new_with_config(config),
+        }
+    }
+
+    fn healthy(&self) -> bool {
+        self.probe.get(&format!("{}/health", self.base)).call().is_ok()
+    }
+
+    /// True when a server with this exact model is already up.
+    fn is_loaded(&self, model: &str) -> bool {
+        self.model == model && self.child.is_some()
+    }
+
+    fn ensure(&mut self, model: &str) -> Result<(), String> {
+        if self.is_loaded(model)
+            && self.child.as_mut().is_some_and(|c| c.try_wait().ok().flatten().is_none())
+        {
+            return Ok(());
+        }
+        // An llama-server someone else started is fine to use — we just don't
+        // own it, so we won't kill it on exit.
+        if self.child.is_none() && self.healthy() {
+            self.model = model.to_string();
+            return Ok(());
+        }
+
+        self.stop();
+        let server = find_llama_server().ok_or_else(|| {
+            "llama-server.exe not found — install llama.cpp (winget install llama.cpp)".to_string()
+        })?;
+        let gguf = resolve_gguf(&self.root, model).ok_or_else(|| {
+            format!("model file for '{model}' not found under {}", self.root.display())
+        })?;
+
+        let mut cmd = Command::new(&server);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — no extra console
+        cmd.args([
+            "-m", gguf.to_string_lossy().as_ref(),
+            "--host", "127.0.0.1",
+            "--port", &self.port,
+            "--ctx-size", "32768",
+            "--parallel", "1",
+            "--n-gpu-layers", "99",
+            "--flash-attn", "on",
+            "--cache-type-k", "q8_0",
+            "--cache-type-v", "q8_0",
+            "--no-webui",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+        let child = cmd.spawn().map_err(|e| format!("cannot start llama-server: {e}"))?;
+        self.child = Some(child);
+        self.owned = true;
+        self.model = model.to_string();
+
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(120) {
+            if self.healthy() {
+                return Ok(());
+            }
+            if self.child.as_mut().is_some_and(|c| c.try_wait().ok().flatten().is_some()) {
+                self.stop();
+                return Err("llama-server exited during startup".into());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        self.stop();
+        Err("llama-server did not become healthy within 120s".into())
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            if self.owned {
+                #[cfg(windows)]
+                {
+                    let _ = Command::new("taskkill")
+                        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = child.kill();
+                }
+            }
+            let _ = child.wait();
+        }
+        self.owned = false;
+        self.model.clear();
+    }
+}
+
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn find_llama_server() -> Option<PathBuf> {
+    let finder = if cfg!(windows) { "where" } else { "which" };
+    if let Ok(out) = Command::new(finder).arg("llama-server").output() {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let p = PathBuf::from(line.trim());
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let base = PathBuf::from(local).join("Microsoft/WinGet/Packages");
+        if let Ok(rd) = std::fs::read_dir(&base) {
+            for e in rd.flatten() {
+                let direct = e.path().join("llama-server.exe");
+                if direct.exists() {
+                    return Some(direct);
+                }
+                if let Ok(inner) = std::fs::read_dir(e.path()) {
+                    for ie in inner.flatten() {
+                        let p = ie.path().join("llama-server.exe");
+                        if p.exists() {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for env in ["PERIHEL_LLAMA_SERVER", "LLAMA_BIN"] {
+        if let Ok(v) = std::env::var(env) {
+            let p = PathBuf::from(&v);
+            let exe = if p.is_dir() { p.join("llama-server.exe") } else { p };
+            if exe.exists() {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_gguf(root: &Path, name: &str) -> Option<PathBuf> {
+    let wanted = name.trim();
+    for p in [root.join("models").join(wanted), root.join(wanted), PathBuf::from("models").join(wanted)] {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let with_ext = format!("{wanted}.gguf");
+    for p in [root.join("models").join(&with_ext), root.join(&with_ext), PathBuf::from("models").join(&with_ext)] {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    fn walk(dir: &Path, target: &str) -> Option<PathBuf> {
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if let Some(found) = walk(&p, target) {
+                    return Some(found);
+                }
+            } else if p.to_string_lossy().to_lowercase().contains(&target.to_lowercase()) {
+                return Some(p);
+            }
+        }
+        None
+    }
+    walk(root, wanted)
+}
+
 // ------------------------------------------------------------------ agent
 
 struct App {
     client: Client,
+    sidecar: Sidecar,
     root: PathBuf,
     max_rounds: usize,
     tui: bool,
@@ -983,9 +1187,42 @@ impl App {
         else { println!("{text}"); }
     }
 
+    /// Switch model and bring its server up right away (the same "starting
+    /// model" announcement a request produces).
+    fn set_model(&mut self, name: String) {
+        if self.client.model == name && self.sidecar.is_loaded(&name) {
+            self.inform(&format!("model = {name}"));
+            return;
+        }
+        self.sidecar.stop();
+        self.client.model = name.clone();
+        self.inform(&format!("model = {name}"));
+        self.inform(&format!("starting model {name}..."));
+        match self.sidecar.ensure(&name) {
+            Ok(()) => self.inform("model ready"),
+            Err(e) => {
+                if !self.tui { eprintln!("[error] model start failed: {e}"); }
+                self.add("error", &format!("model start failed: {e}"));
+            }
+        }
+    }
+
     fn run_turn(&mut self, user: &str) {
         // Pick up MEMORY.md edits and notes added by the previous turn.
         refresh_system(&mut self.client, &self.root);
+        // llama-server is started here — on the first request, never at launch.
+        let starting = !self.sidecar.is_loaded(&self.client.model);
+        if starting {
+            self.inform(&format!("starting model {}...", self.client.model));
+        }
+        if let Err(e) = self.sidecar.ensure(&self.client.model) {
+            if !self.tui { eprintln!("[error] model start failed: {e}"); }
+            self.add("error", &format!("model start failed: {e}"));
+            return;
+        }
+        if starting {
+            self.inform("model ready");
+        }
         self.client.messages.push(json!({"role":"user","content":user}));
         self.add("user", user);
         let mut round = 0;
@@ -1455,6 +1692,7 @@ fn main() {
     }
     let mut app = App {
         client,
+        sidecar: Sidecar::new(&cli.base_url, &root),
         root,
         max_rounds: cli.max_rounds,
         tui: !cli.cli,
@@ -1532,17 +1770,17 @@ fn main() {
                             let i = c.to_digit(10).unwrap_or(0) as usize;
                             if i < app.model_list.len() {
                                 app.model_cursor = i;
-                                app.client.model = app.model_list[i].clone();
+                                let name = app.model_list[i].clone();
                                 app.picking_model = false;
-                                app.inform(&format!("model = {}", app.client.model));
+                                app.set_model(name);
                             }
                         }
                         Key::Enter => {
-                            if let Some(m) = app.model_list.get(app.model_cursor).cloned() {
-                                app.client.model = m;
-                            }
+                            let name = app.model_list.get(app.model_cursor).cloned();
                             app.picking_model = false;
-                            app.inform(&format!("model = {}", app.client.model));
+                            if let Some(name) = name {
+                                app.set_model(name);
+                            }
                         }
                         Key::Esc | Key::Char('q', false) => {
                             app.picking_model = false;
@@ -1703,8 +1941,7 @@ fn main() {
                     }
                     "model" => {
                         if !rest.is_empty() {
-                            app.client.model = rest.trim().to_string();
-                            app.inform(&format!("model = {}", app.client.model));
+                            app.set_model(rest.trim().to_string());
                         } else {
                             app.model_list = app.client.available_models(&app.root);
                             app.model_cursor = app.model_list.iter()
@@ -1774,6 +2011,8 @@ fn main() {
             app.save_current_session();
         }
     }
+
+    app.sidecar.stop();   // llama-server lives only as long as this harness
 
     if app.tui {
         print!("\x1b[?25h\x1b[?1049l");
@@ -1884,6 +2123,7 @@ mod layout_tests {
     fn frame_fits_small_windows() {
         let app = App {
             client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            sidecar: Sidecar::new("http://127.0.0.1:1", Path::new(".")),
             root: PathBuf::from("."),
             max_rounds: 0,
             tui: true,
@@ -1920,6 +2160,7 @@ mod layout_tests {
     fn markdown_reply_fits_narrow_windows() {
         let app = App {
             client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            sidecar: Sidecar::new("http://127.0.0.1:1", Path::new(".")),
             root: PathBuf::from("."),
             max_rounds: 0,
             tui: true,
@@ -1970,6 +2211,7 @@ mod layout_tests {
     fn assistant_rows_are_markdown_but_tool_rows_are_plain() {
         let app = App {
             client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            sidecar: Sidecar::new("http://127.0.0.1:1", Path::new(".")),
             root: PathBuf::from("."),
             max_rounds: 0,
             tui: true,
@@ -2028,6 +2270,7 @@ mod layout_tests {
     fn body_text_is_never_erased() {
         let app = App {
             client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            sidecar: Sidecar::new("http://127.0.0.1:1", Path::new(".")),
             root: PathBuf::from("."),
             max_rounds: 0,
             tui: true,
@@ -2059,6 +2302,7 @@ mod layout_tests {
             .collect();
         let mut app = App {
             client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            sidecar: Sidecar::new("http://127.0.0.1:1", Path::new(".")),
             root: PathBuf::from("."),
             max_rounds: 0,
             tui: true,
@@ -2089,6 +2333,7 @@ mod layout_tests {
     fn slash_menu_has_a_movable_pointer() {
         let app = App {
             client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            sidecar: Sidecar::new("http://127.0.0.1:1", Path::new(".")),
             root: PathBuf::from("."),
             max_rounds: 0,
             tui: true,

@@ -48,6 +48,16 @@ no longer typed out and then printed again as the parsed reply: you see
 `[round N] thinking...`, the stats line, and then `[assistant] ...` once. With
 `--no-grammar` the model's text still streams typewriter-style.
 
+The llama.cpp server is managed for you: it is **not started when the harness
+opens**. The first request (or a `/model` switch) starts it, the TUI shows
+`starting model <name>...` / `model ready`, and it stays loaded for the whole
+session. It is stopped when the harness exits (quit, Ctrl+C, or `--prompt`
+finishing), so no `llama-server.exe` is left behind. An already-running server
+is reused and left alone on exit. Model files are resolved from
+`<workspace>/models/`, `<workspace>/`, and `models/` by name (with or without
+`.gguf`); llama-server is found on PATH, under WinGet packages, or via
+`PERIHEL_LLAMA_SERVER` / `LLAMA_BIN`.
+
 The llama.cpp server here runs with `--parallel 1`, so a long generation blocks
 later requests. Keep thinking off for interactive use.
 
