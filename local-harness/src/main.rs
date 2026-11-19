@@ -148,6 +148,78 @@ fn print_stats(tokens: u64, chars: usize, elapsed: Duration) {
     println!("{}", stats_line(tokens, chars, elapsed));
 }
 
+// GGUF discovery. The harness is often launched from a folder with no
+// models/ of its own, so also look at sibling projects, PERIHEL_MODELS_DIR
+// and the user profile. This is what makes "local-model" resolve to the
+// real Qwen file instead of failing with "model file not found".
+//
+// When several GGUFs exist, prefer the local coding model (Qwen coder) over
+// unrelated ones such as OCR/embedding models. Override with PERIHEL_MODEL.
+fn model_score(name: &str) -> i32 {
+    let n = name.to_lowercase();
+    let mut score = 0;
+    if n.contains("qwen") { score += 100; }
+    if n.contains("coder") { score += 20; }
+    if n.contains("3d") { score += 10; }
+    if n.contains("ocr") || n.contains("embed") || n.contains("mmproj") { score -= 100; }
+    score
+}
+
+fn model_search_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(v) = std::env::var("PERIHEL_MODELS_DIR") {
+        for part in v.split([';', ',']) {
+            let p = part.trim();
+            if !p.is_empty() {
+                dirs.push(PathBuf::from(p));
+            }
+        }
+    }
+    dirs.push(root.join("models"));
+    dirs.push(root.to_path_buf());
+    dirs.push(PathBuf::from("models"));
+    if let Some(parent) = root.parent() {
+        if let Ok(rd) = fs::read_dir(parent) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p.join("models"));
+                    dirs.push(p);
+                }
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        let h = PathBuf::from(home);
+        dirs.push(h.join(".llama").join("models"));
+        dirs.push(h.join("models"));
+    }
+    dirs
+}
+
+fn discover_models(root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in model_search_dirs(root) {
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("gguf")
+                    && !p.to_string_lossy().to_lowercase().contains("mmproj")
+                {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        let sa = model_score(&a.file_name().unwrap_or_default().to_string_lossy());
+        let sb = model_score(&b.file_name().unwrap_or_default().to_string_lossy());
+        sb.cmp(&sa).then_with(|| a.cmp(b))
+    });
+    out.dedup();
+    out
+}
+
 impl Client {
     fn new(base: &str, model: &str, grammar: Option<String>, thinking: bool) -> Self {
         let mut messages = Vec::new();
@@ -180,20 +252,12 @@ impl Client {
                 }
             }
         }
-        let dirs = vec![root.to_path_buf(), root.join("models"), PathBuf::from("models")];
-        for dir in dirs {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if p.extension().and_then(|s| s.to_str()) == Some("gguf") {
-                        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                        if !name.to_lowercase().contains("mmproj") { out.push(name); }
-                    }
-                }
+        for p in discover_models(root) {
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if !out.contains(&name) {
+                out.push(name);
             }
         }
-        out.sort();
-        out.dedup();
         out
     }
 
@@ -1111,32 +1175,25 @@ fn find_llama_server() -> Option<PathBuf> {
 }
 
 fn resolve_gguf(root: &Path, name: &str) -> Option<PathBuf> {
-    let wanted = name.trim();
-    for p in [root.join("models").join(wanted), root.join(wanted), PathBuf::from("models").join(wanted)] {
+    if let Ok(v) = std::env::var("PERIHEL_MODEL") {
+        let p = PathBuf::from(v);
         if p.exists() {
             return Some(p);
         }
     }
-    let with_ext = format!("{wanted}.gguf");
-    for p in [root.join("models").join(&with_ext), root.join(&with_ext), PathBuf::from("models").join(&with_ext)] {
-        if p.exists() {
-            return Some(p);
-        }
+    let wanted = name.trim().to_lowercase();
+    let candidates = discover_models(root);
+    if let Some(p) = candidates.iter().find(|p| {
+        let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        n == wanted || n == format!("{wanted}.gguf")
+    }) {
+        return Some(p.clone());
     }
-    fn walk(dir: &Path, target: &str) -> Option<PathBuf> {
-        for e in std::fs::read_dir(dir).ok()?.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                if let Some(found) = walk(&p, target) {
-                    return Some(found);
-                }
-            } else if p.to_string_lossy().to_lowercase().contains(&target.to_lowercase()) {
-                return Some(p);
-            }
-        }
-        None
+    // The "local-model" placeholder means: use whatever GGUF we can find.
+    if wanted.is_empty() || wanted == "local-model" {
+        return candidates.into_iter().next();
     }
-    walk(root, wanted)
+    candidates.into_iter().find(|p| p.to_string_lossy().to_lowercase().contains(&wanted))
 }
 
 // ------------------------------------------------------------------ agent

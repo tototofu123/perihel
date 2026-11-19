@@ -53,10 +53,12 @@ opens**. The first request (or a `/model` switch) starts it, the TUI shows
 `starting model <name>...` / `model ready`, and it stays loaded for the whole
 session. It is stopped when the harness exits (quit, Ctrl+C, or `--prompt`
 finishing), so no `llama-server.exe` is left behind. An already-running server
-is reused and left alone on exit. Model files are resolved from
-`<workspace>/models/`, `<workspace>/`, and `models/` by name (with or without
-`.gguf`); llama-server is found on PATH, under WinGet packages, or via
-`PERIHEL_LLAMA_SERVER` / `LLAMA_BIN`.
+is reused and left alone on exit. GGUF files are discovered in
+`<workspace>/models/`, sibling project folders, `PERIHEL_MODELS_DIR`, and
+`~/.llama/models` — so launching from a folder with no models still finds the
+local Qwen coder model, which is preferred automatically. Override the choice
+with `--model`, `PERIHEL_MODEL` (full path), or `/model`. llama-server is found
+on PATH, under WinGet packages, or via `PERIHEL_LLAMA_SERVER` / `LLAMA_BIN`.
 
 The llama.cpp server here runs with `--parallel 1`, so a long generation blocks
 later requests. Keep thinking off for interactive use.
