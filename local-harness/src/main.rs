@@ -259,8 +259,14 @@ impl Client {
                     thinking_header = false;
                 }
                 full.push_str(content);
-                print!("{content}");
-                let _ = io::stdout().flush();
+                // With a grammar attached every completion is a tool-call JSON
+                // document, so typing it out only to have the caller print the
+                // parsed reply afterwards shows the same text twice. Stream it
+                // only when the grammar is off (free-form prose).
+                if self.grammar.is_none() {
+                    print!("{content}");
+                    let _ = io::stdout().flush();
+                }
             }
         }
         if thinking_header { print!("\x1b[0m"); }

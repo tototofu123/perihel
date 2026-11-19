@@ -42,6 +42,12 @@ whole budget without producing a tool call, the harness retries once with
 thinking off. Every generation prints `[stats] N tokens in X.Xs = Y.Y tok/s`
 (in the TUI, in the status bar).
 
+In `--cli` mode the completion is streamed, but with the grammar on every
+completion is a tool-call JSON document rather than prose, so the raw JSON is
+no longer typed out and then printed again as the parsed reply: you see
+`[round N] thinking...`, the stats line, and then `[assistant] ...` once. With
+`--no-grammar` the model's text still streams typewriter-style.
+
 The llama.cpp server here runs with `--parallel 1`, so a long generation blocks
 later requests. Keep thinking off for interactive use.
 
