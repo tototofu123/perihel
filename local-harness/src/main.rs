@@ -43,6 +43,11 @@ Tools:
 - {"tool":"reply.text","args":{"text":"..."}}  finish the turn
 Rules: one tool per reply; paths are relative to the workspace, no absolute paths or `..`;
 inspect before writing, verify after writing; never claim success you did not verify.
+`reply.text` is the right tool for greetings, a bare "test", or any prompt with no concrete
+task: do not call fs/web/run/memory tools just because the grammar requires one tool per reply.
+`memory.add` is ONLY for durable facts that will still be true next week (project commands,
+conventions, stable user preferences). Never save the current prompt, "no task given",
+"waiting for instructions", a test result, or anything about this conversation.
 The Memory section below is your persistent notes file; trust it and keep it current.
 
 ## Verify before you answer
@@ -640,7 +645,8 @@ fn memory_block(root: &Path) -> String {
     out.push_str(&read_memory(&local).unwrap_or_else(|| "(empty)".into()));
     out.push_str("\n\nUse {\"tool\":\"memory.add\",\"args\":{\"scope\":\"local\",\"text\":\"...\"}} \
 to keep a durable fact or a project rule; use scope \"global\" for things true in every project. \
-Memory is re-read at the start of every turn.\n");
+Memory is re-read at the start of every turn. Never write notes about this conversation, a bare \
+\"test\", or a prompt with no task - stale notes are worse than none.\n");
     out
 }
 
@@ -757,25 +763,71 @@ fn load_session(client: &mut Client, path: &Path) -> Result<(), String> {
 // ------------------------------------------------------------------ web tools
 
 #[derive(Default)]
-struct WebRate { last: Option<Instant>, times: VecDeque<Instant> }
+struct WebRate { search: VecDeque<Instant>, fetch: VecDeque<Instant> }
 static WEB_RATE: OnceLock<Mutex<WebRate>> = OnceLock::new();
 
-fn web_slot() -> Result<(), String> {
-    let mut state = WEB_RATE.get_or_init(|| Mutex::new(WebRate::default()))
-        .lock().map_err(|e| e.to_string())?;
-    let now = Instant::now();
-    state.times.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
-    if let Some(last) = state.last {
-        if now.duration_since(last) < Duration::from_secs(5) {
-            return Err("web rate limit: wait 5s between calls".into());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WebKind { Search, Fetch }
+
+#[derive(Debug, PartialEq, Eq)]
+enum SlotError {
+    /// A same-kind call happened less than 5 s ago; we can just wait it out.
+    Gap(Duration),
+    /// 10 calls in the last minute; retry after this delay.
+    Quota(Duration),
+}
+
+impl WebRate {
+    fn bucket(&mut self, kind: WebKind) -> &mut VecDeque<Instant> {
+        match kind { WebKind::Search => &mut self.search, WebKind::Fetch => &mut self.fetch }
+    }
+
+    fn reserve(&mut self, kind: WebKind, now: Instant) -> Result<Instant, SlotError> {
+        self.search.retain(|t| now.saturating_duration_since(*t) < Duration::from_secs(60));
+        self.fetch.retain(|t| now.saturating_duration_since(*t) < Duration::from_secs(60));
+        if self.search.len() + self.fetch.len() >= 10 {
+            let oldest = self.search.iter().chain(self.fetch.iter()).min().copied().unwrap_or(now);
+            let retry = Duration::from_secs(60).saturating_sub(now.saturating_duration_since(oldest));
+            return Err(SlotError::Quota(retry.max(Duration::from_secs(1))));
+        }
+        let bucket = self.bucket(kind);
+        if let Some(last) = bucket.back() {
+            let wait = Duration::from_secs(5).saturating_sub(now.saturating_duration_since(*last));
+            if !wait.is_zero() { return Err(SlotError::Gap(wait)); }
+        }
+        bucket.push_back(now);
+        Ok(now)
+    }
+
+    fn unreserve(&mut self, kind: WebKind, when: Instant) {
+        let bucket = self.bucket(kind);
+        if let Some(i) = bucket.iter().position(|t| *t == when) { bucket.remove(i); }
+    }
+}
+
+/// Wait out a short gap so a model-driven search -> fetch pair just works;
+/// only a real per-minute quota is surfaced to the model as an error.
+fn web_slot(kind: WebKind) -> Result<Instant, String> {
+    for _ in 0..2 {
+        let attempt = {
+            let mut state = WEB_RATE.get_or_init(|| Mutex::new(WebRate::default()))
+                .lock().map_err(|e| e.to_string())?;
+            state.reserve(kind, Instant::now())
+        };
+        match attempt {
+            Ok(when) => return Ok(when),
+            Err(SlotError::Gap(wait)) => std::thread::sleep(wait),
+            Err(SlotError::Quota(retry)) => return Err(format!(
+                "web rate limit: 10 calls per minute reached, try again in {}s", retry.as_secs())),
         }
     }
-    if state.times.len() >= 10 {
-        return Err("web rate limit: 10 calls per minute reached".into());
+    Err("web rate limit: busy, try again".into())
+}
+
+fn web_unreserve(kind: WebKind, when: Instant) {
+    if let Ok(mut state) = WEB_RATE.get_or_init(|| Mutex::new(WebRate::default())).lock() {
+        state.unreserve(kind, when);
     }
-    state.last = Some(now);
-    state.times.push_back(now);
-    Ok(())
 }
 
 fn html_unescape(s: &str) -> String {
@@ -794,34 +846,35 @@ fn url_encode(s: &str) -> String {
     out
 }
 
-fn http_get(url: &str, timeout_s: u64) -> Result<String, String> {
+/// Returns the HTTP status as well as the body: a 404 must be data the model
+/// can react to (try the next link), not an opaque transport error.
+fn http_get_status(url: &str, timeout_s: u64) -> Result<(u16, String), String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("only http(s) URLs are allowed".into());
     }
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(timeout_s)))
+        .http_status_as_error(false)
         .build();
     let agent = ureq::Agent::new_with_config(config);
     let resp = agent.get(url)
         .header("User-Agent", "Mozilla/5.0 (compatible; perihel-local/0.1)")
         .call()
-        .map_err(|e| format!("request failed: {e}"))?;
-    let mut body = resp.into_body();
-    let bytes = body.read_to_vec().map_err(|e| format!("read failed: {e}"))?;
+        .map_err(|e| format!("request failed for {url}: {e}"))?;
+    let status = resp.status();
+    let bytes = resp.into_body().read_to_vec().map_err(|e| format!("read failed for {url}: {e}"))?;
     let limited = if bytes.len() > 2 * 1024 * 1024 { &bytes[..2 * 1024 * 1024] } else { &bytes };
-    Ok(String::from_utf8_lossy(limited).to_string())
+    Ok((status.into(), String::from_utf8_lossy(limited).to_string()))
 }
 
 fn web_search(args: &Value) -> ToolResult {
     let query = match arg_str(args, "query") { Ok(q) => q, Err(e) => return ToolResult { ok: false, output: String::new(), refused: Some(e) } };
-    if let Err(e) = web_slot() {
-        return ToolResult { ok: false, output: String::new(), refused: Some(e) };
-    }
-    let url = format!("https://www.bing.com/search?format=rss&q={}", url_encode(query));
-    let body = match http_get(&url, 15) {
-        Ok(b) => b,
+    let slot = match web_slot(WebKind::Search) {
+        Ok(s) => s,
         Err(e) => return ToolResult { ok: false, output: e, refused: None },
     };
+    let url = format!("https://www.bing.com/search?format=rss&q={}", url_encode(query));
+    let body = match http_body(&url, 15, slot, WebKind::Search) { Ok(b) => b, Err(t) => return t };
     let mut out = Vec::new();
     for item in body.split("<item>").skip(1) {
         let item = item.split("</item>").next().unwrap_or(item);
@@ -841,19 +894,40 @@ fn web_search(args: &Value) -> ToolResult {
         }
         if out.len() >= 8 { break; }
     }
-    let text = if out.is_empty() { "no results (Bing RSS returned no items)".into() } else { out.join("\n") };
+    let text = if out.is_empty() {
+        web_unreserve(WebKind::Search, slot);
+        "no results (Bing RSS returned no items)".into()
+    } else { out.join("\n") };
     ToolResult { ok: true, output: text, refused: None }
+}
+
+/// A failed request does not burn one of the 10 slots, and a 4xx/5xx is
+/// reported with its URL and body so the model can try the next result.
+fn http_body(url: &str, timeout_s: u64, slot: Instant, kind: WebKind) -> Result<String, ToolResult> {
+    match http_get_status(url, timeout_s) {
+        Ok((status, body)) if status < 400 => Ok(body),
+        Ok((status, body)) => {
+            web_unreserve(kind, slot);
+            Err(ToolResult {
+                ok: false,
+                output: format!("HTTP {status} for {url}\n{}", truncate_chars(body.trim(), 300)),
+                refused: None,
+            })
+        }
+        Err(e) => {
+            web_unreserve(kind, slot);
+            Err(ToolResult { ok: false, output: e, refused: None })
+        }
+    }
 }
 
 fn web_fetch(args: &Value) -> ToolResult {
     let url = match arg_str(args, "url") { Ok(u) => u, Err(e) => return ToolResult { ok: false, output: String::new(), refused: Some(e) } };
-    if let Err(e) = web_slot() {
-        return ToolResult { ok: false, output: String::new(), refused: Some(e) };
-    }
-    let html = match http_get(url, 15) {
-        Ok(h) => h,
+    let slot = match web_slot(WebKind::Fetch) {
+        Ok(s) => s,
         Err(e) => return ToolResult { ok: false, output: e, refused: None },
     };
+    let html = match http_body(url, 15, slot, WebKind::Fetch) { Ok(h) => h, Err(t) => return t };
     let mut text = String::new();
     let mut skip = 0usize;
     let mut rest = html.as_str();
@@ -2090,6 +2164,33 @@ mod tool_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn web_rate_separates_search_and_fetch_and_releases_failed_calls() {
+        let mut r = WebRate::default();
+        let t0 = Instant::now();
+        r.reserve(WebKind::Search, t0).unwrap();
+        // The normal search -> fetch flow must not trip a shared 5 s gap.
+        assert!(r.reserve(WebKind::Fetch, t0).is_ok());
+        assert_eq!(r.reserve(WebKind::Fetch, t0), Err(SlotError::Gap(Duration::from_secs(5))));
+
+        let later = t0 + Duration::from_secs(6);
+        let reserved = r.reserve(WebKind::Fetch, later).unwrap();
+        r.unreserve(WebKind::Fetch, reserved);
+        assert!(r.reserve(WebKind::Fetch, later).is_ok(), "failed calls release their slot");
+    }
+
+    #[test]
+    fn web_rate_quota_expires_after_a_minute() {
+        let mut r = WebRate::default();
+        let t0 = Instant::now();
+        for i in 0..10 {
+            r.reserve(WebKind::Search, t0 + Duration::from_secs(i * 6)).unwrap();
+        }
+        assert!(matches!(r.reserve(WebKind::Fetch, t0 + Duration::from_secs(59)),
+                         Err(SlotError::Quota(_))));
+        assert!(r.reserve(WebKind::Fetch, t0 + Duration::from_secs(61)).is_ok());
     }
 
     #[test]

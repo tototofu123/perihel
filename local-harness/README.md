@@ -164,9 +164,19 @@ Tools: `fs.list`, `fs.read`, `fs.write`, `fs.mkdir`, `fs.copy`, `run.cmd`,
 workspace-sandboxed, commands are
 allowlisted with no shell, bounded output, 120 s timeout (see above).
 `web.search` uses
-keyless Bing RSS (8 results, 5 s gap, 10/min) and `web.fetch` strips
-script/style/nav from a page (2 MB cap, 6k chars). `enable_thinking` is
-off to avoid the reasoning loops measured with Qwen3.5-4B.
+keyless Bing RSS (8 results) and `web.fetch` strips
+script/style/nav from a page (2 MB cap, 6k chars). Search and fetch have
+**separate** rate-limit buckets (5 s per bucket, 10 calls/min total), so the
+normal search -> fetch flow is never refused: a short gap is waited out inside
+the tool, and failed calls do not consume a slot. A 404/5xx is returned with
+its URL and body so the model can try the next link instead of answering from
+memory. `enable_thinking` is off to avoid the reasoning loops measured with
+Qwen3.5-4B.
+
+`memory.add` is for durable facts only (project commands, conventions, stable
+preferences). For greetings, a bare `test`, or a prompt with no concrete task,
+the model is told to answer with `reply.text` immediately - no tool calls and
+no notes about the conversation itself.
 
 The allowlist covers the usual verification commands: `python script.py`,
 `python -m pytest|http.server|py_compile|json.tool`, `node`/`npm`/`npx`
