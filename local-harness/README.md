@@ -176,6 +176,13 @@ fetches; after 5 it ends the turn rather than letting the model guess dozens of
 URLs. `enable_thinking` is off to avoid the reasoning loops measured with
 Qwen3.5-4B.
 
+**No invented URLs.** The system prompt requires `web.search` first whenever
+the exact address is unknown. `web.fetch` enforces that generically: it only
+fetches an exact link returned by a recent search (or any URL on a domain that
+appeared in one), plus `127.0.0.1`/`localhost` for verifying a dev server.
+Everything else is refused with a `call web.search first` message. No
+per-topic or per-site tools are hard-coded.
+
 `memory.add` is for durable facts only (project commands, conventions, stable
 preferences). For greetings, a bare `test`, or a prompt with no concrete task,
 the model is told to answer with `reply.text` immediately - no tool calls and

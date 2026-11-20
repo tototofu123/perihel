@@ -45,6 +45,9 @@ Rules: one tool per reply; paths are relative to the workspace, no absolute path
 inspect before writing, verify after writing; never claim success you did not verify.
 `reply.text` is the right tool for greetings, a bare "test", or any prompt with no concrete
 task: do not call fs/web/run/memory tools just because the grammar requires one tool per reply.
+Never invent a URL: if you do not know the exact address of a source, call `web.search` first
+and fetch one of the links it returns. `web.fetch` only accepts links from a recent search
+(or a localhost URL you are verifying).
 `memory.add` is ONLY for durable facts that will still be true next week (project commands,
 conventions, stable user preferences). Never save the current prompt, "no task given",
 "waiting for instructions", a test result, or anything about this conversation.
@@ -831,6 +834,68 @@ fn web_unreserve(kind: WebKind, when: Instant) {
     }
 }
 
+// Only URLs that actually came back from a search (plus localhost dev servers)
+// may be fetched. The model otherwise invents plausible-looking weather/news
+// URLs from memory and burns turns on 404s.
+static SEARCH_LINKS: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+
+fn remember_links(known: &mut VecDeque<String>, links: &[String]) {
+    for link in links {
+        let link = normalise_url(link);
+        if link.is_empty() { continue; }
+        if !known.contains(&link) { known.push_back(link); }
+    }
+    while known.len() > 40 { known.pop_front(); }
+}
+
+fn remember_search_links(links: &[String]) {
+    if let Ok(mut known) = SEARCH_LINKS.get_or_init(|| Mutex::new(VecDeque::new())).lock() {
+        remember_links(&mut known, links);
+    }
+}
+
+fn normalise_url(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/').to_lowercase();
+    url.replace("http://www.", "http://").replace("https://www.", "https://")
+}
+
+fn is_local_url(url: &str) -> bool {
+    let u = normalise_url(url);
+    u.starts_with("http://127.0.0.1")
+        || u.starts_with("http://localhost")
+        || u.starts_with("http://[::1]")
+}
+
+fn url_host(url: &str) -> String {
+    let u = url.trim().to_lowercase();
+    let rest = u.split_once("://").map(|(_, r)| r).unwrap_or(&u);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    host.strip_prefix("www.").unwrap_or(host).to_string()
+}
+
+fn fetch_url_allowed(url: &str, known: &VecDeque<String>) -> bool {
+    if is_local_url(url) { return true; }
+    if known.contains(&normalise_url(url)) { return true; }
+    // Once a domain appeared in the results, a different path on that same
+    // site is fine - models often remember the right site but not the URL.
+    let host = url_host(url);
+    !host.is_empty() && known.iter().any(|k| url_host(k) == host)
+}
+
+fn fetch_url_guard(url: &str) -> Result<(), ToolResult> {
+    let known = SEARCH_LINKS.get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock().map_err(|e| ToolResult { ok: false, output: e.to_string(), refused: None })?;
+    if fetch_url_allowed(url, &known) { return Ok(()); }
+    Err(ToolResult {
+        ok: false,
+        output: format!(
+            "URL was not returned by a search, so it was not fetched: {url}\n\
+             Call {{\"tool\":\"web.search\",\"args\":{{\"query\":\"...\"}}}} first, then fetch one of the links it returns. \
+             (Localhost URLs are always allowed for verifying a dev server.)"),
+        refused: None,
+    })
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum WebGuardAction { Run, Refuse, Stop }
 
@@ -891,6 +956,7 @@ fn web_search(args: &Value) -> ToolResult {
     let url = format!("https://www.bing.com/search?format=rss&q={}", url_encode(query));
     let body = match http_body(&url, 15, slot, WebKind::Search) { Ok(b) => b, Err(t) => return t };
     let mut out = Vec::new();
+    let mut links = Vec::new();
     for item in body.split("<item>").skip(1) {
         let item = item.split("</item>").next().unwrap_or(item);
         let tag = |name: &str| -> String {
@@ -906,13 +972,17 @@ fn web_search(args: &Value) -> ToolResult {
         let desc = tag("description");
         if !title.is_empty() {
             out.push(format!("- {title}\n  {link}\n  {}", truncate_chars(&desc, 300)));
+            if !link.is_empty() { links.push(link.clone()); }
         }
         if out.len() >= 8 { break; }
     }
     let text = if out.is_empty() {
         web_unreserve(WebKind::Search, slot);
         "no results (Bing RSS returned no items)".into()
-    } else { out.join("\n") };
+    } else {
+        remember_search_links(&links);
+        out.join("\n")
+    };
     ToolResult { ok: true, output: text, refused: None }
 }
 
@@ -938,6 +1008,7 @@ fn http_body(url: &str, timeout_s: u64, slot: Instant, kind: WebKind) -> Result<
 
 fn web_fetch(args: &Value) -> ToolResult {
     let url = match arg_str(args, "url") { Ok(u) => u, Err(e) => return ToolResult { ok: false, output: String::new(), refused: Some(e) } };
+    if let Err(t) = fetch_url_guard(url) { return t; }
     let slot = match web_slot(WebKind::Fetch) {
         Ok(s) => s,
         Err(e) => return ToolResult { ok: false, output: e, refused: None },
@@ -2211,6 +2282,25 @@ mod tool_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn web_fetch_rejects_guessed_urls_but_allows_search_and_local() {
+        let mut known = VecDeque::new();
+        remember_links(&mut known, &[
+            "https://www.Weather.com/HK/".to_string(),
+            "https://example.com/a".to_string(),
+        ]);
+        assert_eq!(known.len(), 2);
+        assert!(fetch_url_allowed("https://weather.com/HK", &known), "case/www/trailing slash normalised");
+        assert!(fetch_url_allowed("https://www.weather.com/forecast/today", &known), "same site, different path");
+        assert!(fetch_url_allowed("http://127.0.0.1:8123/", &known), "localhost dev server always allowed");
+        assert!(!fetch_url_allowed("https://nowweather.com/weather/hong-kong", &known), "invented domain refused");
+        assert!(!fetch_url_allowed("", &VecDeque::new()));
+
+        let many: Vec<String> = (0..50).map(|i| format!("https://example.com/{i}")).collect();
+        remember_links(&mut known, &many);
+        assert_eq!(known.len(), 40, "link memory is bounded");
     }
 
     #[test]
