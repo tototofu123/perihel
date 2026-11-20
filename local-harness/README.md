@@ -163,12 +163,13 @@ Tools: `fs.list`, `fs.read`, `fs.write`, `fs.mkdir`, `fs.copy`, `run.cmd`,
 `memory.add`, `reply.text`. All paths are
 workspace-sandboxed, commands are
 allowlisted with no shell, bounded output, 120 s timeout (see above).
-`web.search` uses
-keyless Bing RSS (8 results) and `web.fetch` strips
-script/style/nav from a page (2 MB cap, 6k chars). Search and fetch have
-**separate** rate-limit buckets (5 s per bucket, 10 calls/min total), so the
-normal search -> fetch flow is never refused: a short gap is waited out inside
-the tool, and failed calls do not consume a slot. A 404/5xx is returned with
+`web.search` uses keyless **DuckDuckGo HTML** (8 ranked results, Bing RSS as
+fallback) and `web.fetch` strips script/style/nav from a page (2 MB cap, 6k
+chars). Search and fetch have **separate** rate-limit buckets (1 s gap, 60
+calls/min total by default; tune with `PERIHEL_WEB_GAP_MS` and
+`PERIHEL_WEB_MAX_MIN`), so the normal search -> fetch flow is never refused: a
+short gap is waited out inside the tool, and failed calls do not consume a
+slot. A 404/5xx is returned with
 its URL and body so the model can try the next link instead of answering from
 memory. After **3 consecutive failed web calls** the harness injects a nudge
 ("answer with what you know, state what is unverified") and refuses further

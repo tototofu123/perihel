@@ -789,14 +789,14 @@ impl WebRate {
     fn reserve(&mut self, kind: WebKind, now: Instant) -> Result<Instant, SlotError> {
         self.search.retain(|t| now.saturating_duration_since(*t) < Duration::from_secs(60));
         self.fetch.retain(|t| now.saturating_duration_since(*t) < Duration::from_secs(60));
-        if self.search.len() + self.fetch.len() >= 10 {
+        if self.search.len() + self.fetch.len() >= web_quota() {
             let oldest = self.search.iter().chain(self.fetch.iter()).min().copied().unwrap_or(now);
             let retry = Duration::from_secs(60).saturating_sub(now.saturating_duration_since(oldest));
             return Err(SlotError::Quota(retry.max(Duration::from_secs(1))));
         }
         let bucket = self.bucket(kind);
         if let Some(last) = bucket.back() {
-            let wait = Duration::from_secs(5).saturating_sub(now.saturating_duration_since(*last));
+            let wait = web_gap().saturating_sub(now.saturating_duration_since(*last));
             if !wait.is_zero() { return Err(SlotError::Gap(wait)); }
         }
         bucket.push_back(now);
@@ -807,6 +807,20 @@ impl WebRate {
         let bucket = self.bucket(kind);
         if let Some(i) = bucket.iter().position(|t| *t == when) { bucket.remove(i); }
     }
+}
+
+/// Keyless search endpoints do not publish a hard quota. Keep a small gap to
+/// be polite and a generous per-minute ceiling; both are tunable with env vars
+/// so a heavy research session is not artificially throttled.
+fn web_gap() -> Duration {
+    let ms = std::env::var("PERIHEL_WEB_GAP_MS").ok()
+        .and_then(|v| v.parse::<u64>().ok()).unwrap_or(1000);
+    Duration::from_millis(ms)
+}
+
+fn web_quota() -> usize {
+    std::env::var("PERIHEL_WEB_MAX_MIN").ok()
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(60)
 }
 
 /// Wait out a short gap so a model-driven search -> fetch pair just works;
@@ -822,7 +836,8 @@ fn web_slot(kind: WebKind) -> Result<Instant, String> {
             Ok(when) => return Ok(when),
             Err(SlotError::Gap(wait)) => std::thread::sleep(wait),
             Err(SlotError::Quota(retry)) => return Err(format!(
-                "web rate limit: 10 calls per minute reached, try again in {}s", retry.as_secs())),
+                "web rate limit: {} calls per minute reached, try again in {}s (set PERIHEL_WEB_MAX_MIN to raise it)",
+                web_quota(), retry.as_secs())),
         }
     }
     Err("web rate limit: busy, try again".into())
@@ -911,8 +926,83 @@ const WEB_GUARD_NUDGE: &str = "WEB GUARD: several web calls failed. Do NOT call 
 Use reply.text now and say exactly what you could not verify.";
 
 fn html_unescape(s: &str) -> String {
-    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        .replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ")
+    s.replace("&amp;", "&").replace("&lt;", "<").replace("&lt;", "<")
+        .replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+}
+
+fn strip_tags(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&html_unescape(&rest[..i]));
+        if let Some(end) = rest[i..].find('>') { rest = &rest[i + end + 1..]; } else { break; }
+    }
+    out.push_str(&html_unescape(rest));
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn hex_digit(c: u8) -> Option<u8> {
+    match c { b'0'..=b'9' => Some(c - b'0'), b'a'..=b'f' => Some(c - b'a' + 10), b'A'..=b'F' => Some(c - b'A' + 10), _ => None }
+}
+
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(a), Some(c)) = (hex_digit(b[i + 1]), hex_digit(b[i + 2])) {
+                out.push(a * 16 + c); i += 3; continue;
+            }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// DuckDuckGo wraps result links in `//duckduckgo.com/l/?uddg=<encoded url>`.
+fn ddg_result_url(href: &str) -> String {
+    let href = html_unescape(href);
+    if let Some((_, tail)) = href.split_once("uddg=") {
+        let encoded = tail.split('&').next().unwrap_or(tail);
+        let decoded = url_decode(encoded);
+        if decoded.starts_with("http://") || decoded.starts_with("https://") { return decoded; }
+    }
+    if href.starts_with("//") { format!("https:{href}") } else { href }
+}
+
+/// Search results as (title, url, snippet).
+fn parse_ddg_results(body: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for block in body.split("class=\"result results_").skip(1) {
+        let title = block.split_once("class=\"result__a\"")
+            .and_then(|(_, r)| r.split_once('>'))
+            .and_then(|(a, rest)| rest.split_once("</a>").map(|(t, _)| (a, t)))
+            .map(|(_, t)| strip_tags(t)).unwrap_or_default();
+        let href = block.split_once("class=\"result__a\"")
+            .and_then(|(_, r)| r.split_once("href=\""))
+            .and_then(|(_, r)| r.split_once('"').map(|(h, _)| h))
+            .map(ddg_result_url).unwrap_or_default();
+        let snippet = block.split_once("class=\"result__snippet\"")
+            .and_then(|(_, r)| r.split_once('>'))
+            .and_then(|(_, r)| r.split_once("</a>").map(|(s, _)| strip_tags(s)))
+            .unwrap_or_default();
+        if !title.is_empty() && href.starts_with("http") {
+            out.push((title, href, snippet));
+        }
+        if out.len() >= 8 { break; }
+    }
+    out
+}
+
+fn ddg_search(query: &str) -> Option<Vec<(String, String, String)>> {
+    let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
+    let (status, body) = http_get_status(&url, 15).ok()?;
+    if status != 200 { return None; }
+    let results = parse_ddg_results(&body);
+    if results.is_empty() { None } else { Some(results) }
 }
 
 fn url_encode(s: &str) -> String {
@@ -953,35 +1043,39 @@ fn web_search(args: &Value) -> ToolResult {
         Ok(s) => s,
         Err(e) => return ToolResult { ok: false, output: e, refused: None },
     };
-    let url = format!("https://www.bing.com/search?format=rss&q={}", url_encode(query));
-    let body = match http_body(&url, 15, slot, WebKind::Search) { Ok(b) => b, Err(t) => return t };
-    let mut out = Vec::new();
-    let mut links = Vec::new();
-    for item in body.split("<item>").skip(1) {
-        let item = item.split("</item>").next().unwrap_or(item);
-        let tag = |name: &str| -> String {
-            let open = format!("<{name}>");
-            let close = format!("</{name}>");
-            item.split_once(&open)
-                .and_then(|(_, rest)| rest.split_once(&close))
-                .map(|(v, _)| html_unescape(v.trim().trim_start_matches("<![CDATA[").trim_end_matches("]]>").trim()))
-                .unwrap_or_default()
-        };
-        let title = tag("title");
-        let link = tag("link");
-        let desc = tag("description");
-        if !title.is_empty() {
-            out.push(format!("- {title}\n  {link}\n  {}", truncate_chars(&desc, 300)));
-            if !link.is_empty() { links.push(link.clone()); }
+    // DuckDuckGo HTML is the primary backend: keyless, no API signup, and it
+    // returns real ranked results instead of the Wikipedia-heavy Bing RSS feed.
+    // Bing RSS stays as a fallback in case DDG is blocked on this network.
+    let mut results = ddg_search(query).unwrap_or_default();
+    if results.is_empty() {
+        let url = format!("https://www.bing.com/search?format=rss&q={}", url_encode(query));
+        if let Ok(body) = http_body(&url, 15, slot, WebKind::Search) {
+            for item in body.split("<item>").skip(1) {
+                let item = item.split("</item>").next().unwrap_or(item);
+                let tag = |name: &str| -> String {
+                    let open = format!("<{name}>");
+                    let close = format!("</{name}>");
+                    item.split_once(&open)
+                        .and_then(|(_, rest)| rest.split_once(&close))
+                        .map(|(v, _)| html_unescape(v.trim().trim_start_matches("<![CDATA[").trim_end_matches("]]>").trim()))
+                        .unwrap_or_default()
+                };
+                let title = tag("title");
+                let link = tag("link");
+                let desc = tag("description");
+                if !title.is_empty() && !link.is_empty() { results.push((title, link, desc)); }
+                if results.len() >= 8 { break; }
+            }
         }
-        if out.len() >= 8 { break; }
     }
-    let text = if out.is_empty() {
+    let text = if results.is_empty() {
         web_unreserve(WebKind::Search, slot);
-        "no results (Bing RSS returned no items)".into()
+        "no results (DuckDuckGo and Bing RSS returned nothing)".into()
     } else {
-        remember_search_links(&links);
-        out.join("\n")
+        remember_search_links(&results.iter().map(|r| r.1.clone()).collect::<Vec<_>>());
+        results.iter()
+            .map(|(t, u, s)| format!("- {t}\n  {u}\n  {}", truncate_chars(s, 300)))
+            .collect::<Vec<_>>().join("\n")
     };
     ToolResult { ok: true, output: text, refused: None }
 }
@@ -2319,11 +2413,11 @@ mod tool_tests {
         let mut r = WebRate::default();
         let t0 = Instant::now();
         r.reserve(WebKind::Search, t0).unwrap();
-        // The normal search -> fetch flow must not trip a shared 5 s gap.
+        // The normal search -> fetch flow must not trip a shared gap.
         assert!(r.reserve(WebKind::Fetch, t0).is_ok());
-        assert_eq!(r.reserve(WebKind::Fetch, t0), Err(SlotError::Gap(Duration::from_secs(5))));
+        assert_eq!(r.reserve(WebKind::Fetch, t0), Err(SlotError::Gap(web_gap())));
 
-        let later = t0 + Duration::from_secs(6);
+        let later = t0 + web_gap() + Duration::from_millis(1);
         let reserved = r.reserve(WebKind::Fetch, later).unwrap();
         r.unreserve(WebKind::Fetch, reserved);
         assert!(r.reserve(WebKind::Fetch, later).is_ok(), "failed calls release their slot");
@@ -2333,12 +2427,29 @@ mod tool_tests {
     fn web_rate_quota_expires_after_a_minute() {
         let mut r = WebRate::default();
         let t0 = Instant::now();
-        for i in 0..10 {
-            r.reserve(WebKind::Search, t0 + Duration::from_secs(i * 6)).unwrap();
+        let step = web_gap().max(Duration::from_millis(1));
+        // Alternate buckets so the per-kind gap does not interfere.
+        for i in 0..web_quota() {
+            let kind = if i % 2 == 0 { WebKind::Search } else { WebKind::Fetch };
+            r.reserve(kind, t0 + step * (i as u32)).unwrap();
         }
-        assert!(matches!(r.reserve(WebKind::Fetch, t0 + Duration::from_secs(59)),
-                         Err(SlotError::Quota(_))));
-        assert!(r.reserve(WebKind::Fetch, t0 + Duration::from_secs(61)).is_ok());
+        let just_before = t0 + step * (web_quota() as u32) - Duration::from_millis(1);
+        assert!(matches!(r.reserve(WebKind::Search, just_before), Err(SlotError::Quota(_))));
+        assert!(r.reserve(WebKind::Search, t0 + Duration::from_secs(61)).is_ok());
+    }
+
+    #[test]
+    fn ddg_results_decode_wrapped_links_and_snippets() {
+        let body = r#"<div class="result results_links web-result">
+          <h2 class="result__title"><a rel="nofollow" class="result__a"
+            href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.accuweather.com%2Fen%2Fhk%2Fweather&amp;rut=abc">Hong Kong Current Weather</a></h2>
+          <a class="result__snippet" href="//duckduckgo.com/l/?uddg=ignored">Get the <b>Hong Kong</b> weather forecast</a>
+        </div>"#;
+        let results = parse_ddg_results(body);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "Hong Kong Current Weather");
+        assert_eq!(results[0].1, "https://www.accuweather.com/en/hk/weather");
+        assert_eq!(results[0].2, "Get the Hong Kong weather forecast");
     }
 
     #[test]
