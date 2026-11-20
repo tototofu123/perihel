@@ -57,7 +57,8 @@ The Memory section below is your persistent notes file; trust it and keep it cur
   (exceptions, "listening on ..."), and `web.fetch http://127.0.0.1:PORT` to confirm the page
   really serves. Use `run.stop` when done so no port is left hijacked.
 - If a check fails, fix it and check again. If you could not verify something, say exactly
-  what is unverified in `reply.text` instead of claiming it works."#;
+  what is unverified in `reply.text` instead of claiming it works. If several web calls fail,
+  stop guessing URLs and answer with that caveat - do not keep trying new links."#;
 
 const TOOLS: &[&str] = &[
     "fs.list", "fs.read", "fs.write", "fs.mkdir", "fs.copy",
@@ -830,6 +831,20 @@ fn web_unreserve(kind: WebKind, when: Instant) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum WebGuardAction { Run, Refuse, Stop }
+
+/// Three failed web calls in a row are enough: a 4xx or a DNS failure almost
+/// never fixes itself by guessing another URL.
+fn web_guard_action(failures: usize) -> WebGuardAction {
+    if failures >= 5 { WebGuardAction::Stop }
+    else if failures >= 3 { WebGuardAction::Refuse }
+    else { WebGuardAction::Run }
+}
+
+const WEB_GUARD_NUDGE: &str = "WEB GUARD: several web calls failed. Do NOT call web.search or web.fetch again. \
+Use reply.text now and say exactly what you could not verify.";
+
 fn html_unescape(s: &str) -> String {
     s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
         .replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ")
@@ -1357,6 +1372,7 @@ impl App {
         self.client.messages.push(json!({"role":"user","content":user}));
         self.add("user", user);
         let mut round = 0;
+        let mut web_failures = 0usize;
         loop {
             round += 1;
             self.round = round;
@@ -1391,7 +1407,38 @@ impl App {
                 self.add("assistant", &text);
                 return;
             }
+            let web_tool = name == "web.search" || name == "web.fetch";
+            // A model that cannot find a working weather URL will happily try
+            // dozens of them. After 3 failures, stop spending web calls and
+            // force it to answer with an explicit "unverified" caveat.
+            match web_guard_action(web_failures) {
+                WebGuardAction::Stop if web_tool => {
+                    let msg = "web guard: too many failed web attempts; ending the turn to avoid an endless retry loop";
+                    self.add("error", msg);
+                    if !self.tui { eprintln!("[guard] {msg}"); }
+                    return;
+                }
+                WebGuardAction::Refuse if web_tool => {
+                    web_failures += 1;
+                    let nudge = WEB_GUARD_NUDGE;
+                    self.client.messages.push(json!({"role":"user","content":nudge}));
+                    self.inform("web guard: refused another fetch; asked the model to answer");
+                    continue;
+                }
+                _ => {}
+            }
             let result = execute(&call, &self.root);
+            if web_tool {
+                if result.ok {
+                    web_failures = 0;
+                } else {
+                    web_failures += 1;
+                    if web_failures == 3 {
+                        self.client.messages.push(json!({"role":"user","content":WEB_GUARD_NUDGE}));
+                        self.inform("web guard: 3 failed web calls; asked the model to answer without more fetches");
+                    }
+                }
+            }
             let preview = result.refused.clone().unwrap_or_else(|| result.output.lines().next().unwrap_or("").to_string());
             if !self.tui {
                 println!("[tool] {name} -> {}", truncate_chars(&preview, 160));
@@ -2164,6 +2211,17 @@ mod tool_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn web_guard_stops_retry_loops() {
+        assert_eq!(web_guard_action(0), WebGuardAction::Run);
+        assert_eq!(web_guard_action(2), WebGuardAction::Run);
+        assert_eq!(web_guard_action(3), WebGuardAction::Refuse);
+        assert_eq!(web_guard_action(4), WebGuardAction::Refuse);
+        assert_eq!(web_guard_action(5), WebGuardAction::Stop);
+        assert_eq!(web_guard_action(20), WebGuardAction::Stop);
+        assert!(WEB_GUARD_NUDGE.contains("reply.text"));
     }
 
     #[test]
