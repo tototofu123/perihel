@@ -170,7 +170,10 @@ script/style/nav from a page (2 MB cap, 6k chars). Search and fetch have
 normal search -> fetch flow is never refused: a short gap is waited out inside
 the tool, and failed calls do not consume a slot. A 404/5xx is returned with
 its URL and body so the model can try the next link instead of answering from
-memory. `enable_thinking` is off to avoid the reasoning loops measured with
+memory. After **3 consecutive failed web calls** the harness injects a nudge
+("answer with what you know, state what is unverified") and refuses further
+fetches; after 5 it ends the turn rather than letting the model guess dozens of
+URLs. `enable_thinking` is off to avoid the reasoning loops measured with
 Qwen3.5-4B.
 
 `memory.add` is for durable facts only (project commands, conventions, stable
