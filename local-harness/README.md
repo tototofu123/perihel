@@ -104,6 +104,12 @@ happens on the styled spans themselves, so every rendered row still fits the
 window at any width (covered at 40 and 64 columns). User, tool and error lines
 stay plain, and `--cli` output stays raw so it can be piped.
 
+The TUI body is grouped into blocks rather than a flat CLI dump: a blank line
+opens each new turn, your prompts use a bold green `>`, replies a bold cyan `*`
+with Markdown formatting, and tool results are dim and indented under a `>`
+so they read as nested evidence instead of another prompt. Errors keep the red
+`!` marker.
+
 The input line is a real line editor, not append-only: **Ctrl+W** deletes the
 word before the cursor, **Ctrl+U** clears to the start, **Ctrl+K** kills to the
 end, **Ctrl+A**/**Ctrl+E** jump to start/end, **Ctrl+Left/Right** (or
