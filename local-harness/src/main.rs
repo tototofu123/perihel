@@ -1756,22 +1756,30 @@ impl App {
         out.push_str(&format!("\x1b[48;5;24m\x1b[97m{}\x1b[0m\n", clip_plain(&header, cols.saturating_sub(1))));
         out.push_str(&format!("{}\n", "-".repeat(cols.saturating_sub(1))));
         let mut lines: Vec<String> = Vec::new();
+        let mut last_kind: Option<&str> = None;
         for (kind, text) in &self.history {
-            let prefix = match kind.as_str() {
-                "user" => "\x1b[32m>\x1b[0m ",
-                "assistant" => "\x1b[36m*\x1b[0m ",
-                "tool" => "\x1b[33m>\x1b[0m ",
-                "error" => "\x1b[31m!\x1b[0m ",
-                _ => "\x1b[34mi\x1b[0m ",
+            // A blank line between turns makes a conversation read like blocks
+            // instead of an undifferentiated CLI transcript.
+            if kind == "user" && last_kind.is_some_and(|k| k != "user") {
+                lines.push(String::new());
+            }
+            // Tool results are nested evidence, not another user prompt.
+            let (prefix, cont, budget) = match kind.as_str() {
+                "user" => ("\x1b[1;32m>\x1b[0m ", "  ", cols.saturating_sub(3)),
+                "assistant" => ("\x1b[1;36m*\x1b[0m ", "  ", cols.saturating_sub(3)),
+                "tool" => ("\x1b[2m  > \x1b[0m", "    ", cols.saturating_sub(5)),
+                "error" => ("\x1b[1;31m!\x1b[0m ", "  ", cols.saturating_sub(3)),
+                _ => ("\x1b[2mi\x1b[0m ", "  ", cols.saturating_sub(3)),
             };
             let body: Vec<String> = if kind == "assistant" {
-                markdown::render(text, cols.saturating_sub(3))
+                markdown::render(text, budget)
             } else {
-                wrap(text, cols.saturating_sub(3))
+                wrap(text, budget)
             };
             for (i, seg) in body.iter().enumerate() {
-                lines.push(format!("{}{}", if i == 0 { prefix } else { "  " }, seg));
+                lines.push(format!("{}{}", if i == 0 { prefix } else { cont }, seg));
             }
+            last_kind = Some(kind);
         }
         if self.busy {
             lines.push("\x1b[33m*\x1b[0m generating... (Ctrl+C stops)".to_string());
@@ -2816,6 +2824,34 @@ mod layout_tests {
         assert_eq!(app.scroll, 1);
         scroll_lines(&mut app, -10);
         assert_eq!(app.scroll, 0, "never scroll above the newest line");
+    }
+
+    #[test]
+    fn frame_groups_turns_and_nests_tool_results() {
+        let app = App {
+            client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            sidecar: Sidecar::new("http://127.0.0.1:1", Path::new(".")),
+            root: PathBuf::from("."),
+            max_rounds: 0, tui: true, round: 2,
+            history: vec![
+                ("user".to_string(), "first prompt".to_string()),
+                ("assistant".to_string(), "answer one".to_string()),
+                ("tool".to_string(), "run.cmd -> hello".to_string()),
+                ("user".to_string(), "second prompt".to_string()),
+                ("assistant".to_string(), "answer two".to_string()),
+            ],
+            picking_model: false, model_list: vec![], model_cursor: 0,
+            picking_session: false, session_list: vec![], session_cursor: 0,
+            session_id: "t".to_string(), busy: false, scroll: 0, suggest_cursor: 0,
+        };
+        let frame = app.frame_with_size("", 0, 64, 30);
+        assert!(frame.contains("\x1b[1;32m>"), "bold green user marker");
+        assert!(frame.contains("\x1b[1;36m*"), "bold cyan assistant marker");
+        assert!(frame.contains("\x1b[2m  > \x1b[0m"), "dim nested tool marker");
+        assert!(frame.contains("\x1b[0K\n\x1b[1;32m>"), "blank line before a new turn");
+        for line in frame.split('\n') {
+            assert!(disp_width_in(line) <= 64, "row too wide: {line:?}");
+        }
     }
 
     #[test]
