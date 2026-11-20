@@ -1100,6 +1100,68 @@ fn http_body(url: &str, timeout_s: u64, slot: Instant, kind: WebKind) -> Result<
     }
 }
 
+/// Many news/weather pages are JavaScript shells. Their `<link rel="alternate">`
+/// usually points at an RSS/Atom feed with the actual data, so follow it when
+/// the visible text is suspiciously thin. Generic - no per-site rules.
+fn find_feed_link(html: &str) -> Option<String> {
+    let mut from = 0usize;
+    while let Some(rel) = html[from..].find("<link") {
+        let start = from + rel;
+        let end = start + html[start..].find('>')?;
+        let tag = &html[start..end];
+        let lower = tag.to_ascii_lowercase();
+        if lower.contains("application/rss+xml") || lower.contains("application/atom+xml") {
+            if let Some(href) = tag.split_once("href=\"")
+                .and_then(|(_, r)| r.split_once('"').map(|(h, _)| h)) {
+                let href = html_unescape(href);
+                if href.starts_with("http://") || href.starts_with("https://") { return Some(href); }
+            }
+        }
+        from = end + 1;
+    }
+    None
+}
+
+fn looks_like_js_shell(text: &str) -> bool {
+    // A rendered page usually has prose; a JS shell leaks CSS/JS into the
+    // readable-text extractor instead.
+    let markers = ["function ", "var ", "display:", "!important", "$(function", "/*", "window.open"];
+    let hits = markers.iter().filter(|m| text.contains(**m)).count();
+    hits >= 2 || text.chars().count() < 500
+}
+
+fn parse_feed_items(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let blocks = body.split("<item>").skip(1).chain(body.split("<entry>").skip(1));
+    for raw in blocks {
+        let block = raw.split("</item>").next().unwrap_or(raw)
+            .split("</entry>").next().unwrap_or(raw);
+        let field = |name: &str| -> String {
+            let open = format!("<{name}>");
+            let close = format!("</{name}>");
+            block.split_once(&open)
+                .and_then(|(_, r)| r.split_once(&close).map(|(v, _)| v))
+                .map(|v| strip_tags(v.trim().trim_start_matches("<![CDATA[").trim_end_matches("]]>")))
+                .unwrap_or_default()
+        };
+        let title = field("title");
+        let detail = field("description");
+        let detail = if detail.is_empty() { field("content") } else { detail };
+        let item = if detail.is_empty() { title } else { format!("{title}: {detail}") };
+        if !item.is_empty() { out.push(truncate_chars(&item, 700)); }
+        if out.len() >= 3 { break; }
+    }
+    out
+}
+
+fn read_feed(url: &str) -> Option<String> {
+    let (status, body) = http_get_status(url, 10).ok()?;
+    if status != 200 { return None; }
+    let items = parse_feed_items(&body);
+    if items.is_empty() { return None; }
+    Some(format!("Feed from {url}:\n{}", items.join("\n")))
+}
+
 fn web_fetch(args: &Value) -> ToolResult {
     let url = match arg_str(args, "url") { Ok(u) => u, Err(e) => return ToolResult { ok: false, output: String::new(), refused: Some(e) } };
     if let Err(t) = fetch_url_guard(url) { return t; }
@@ -1128,8 +1190,17 @@ fn web_fetch(args: &Value) -> ToolResult {
     }
     text.push_str(rest);
     let collapsed: Vec<&str> = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
-    let out = truncate_chars(&collapsed.join("\n"), 6000);
-    let _ = skip;
+    let mut out = truncate_chars(&collapsed.join("\n"), 6000);
+    // JS-rendered pages yield almost no visible text. If the page advertises a
+    // feed, use its items as the structured version of the same content.
+    if looks_like_js_shell(&out) {
+        if let Some(link) = find_feed_link(&html) {
+            if let Some(feed) = read_feed(&link) {
+                out.push_str("\n\n");
+                out.push_str(&feed);
+            }
+        }
+    }
     ToolResult { ok: true, output: out, refused: None }
 }
 
@@ -2376,6 +2447,22 @@ mod tool_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn feed_fallback_parses_linked_rss() {
+        let html = r#"<html><head><link rel="alternate" type="application/rss+xml" title="Current Weather" href="https://rss.weather.gov.hk/rss/CurrentWeather.xml"></head><body>shell</body></html>"#;
+        assert_eq!(find_feed_link(html).as_deref(), Some("https://rss.weather.gov.hk/rss/CurrentWeather.xml"));
+        assert!(find_feed_link("<html><body>nothing</body></html>").is_none());
+
+        let feed = r#"<?xml version="1.0"?><rss><channel><item>
+          <title>Bulletin updated at 15:02 HKT</title>
+          <description><![CDATA[<p>Air temperature : 13 degrees Celsius<br/>Relative Humidity : 91 per cent</p>]]></description>
+        </item></channel></rss>"#;
+        let items = parse_feed_items(feed);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].contains("13 degrees Celsius"), "{:?}", items);
+        assert!(items[0].contains("91 per cent"), "{:?}", items);
     }
 
     #[test]
