@@ -171,7 +171,10 @@ calls/min total by default; tune with `PERIHEL_WEB_GAP_MS` and
 short gap is waited out inside the tool, and failed calls do not consume a
 slot. A 404/5xx is returned with
 its URL and body so the model can try the next link instead of answering from
-memory. After **3 consecutive failed web calls** the harness injects a nudge
+memory. When a page turns out to be a JavaScript shell (CSS/JS leaked into the
+extracted text), `web.fetch` follows the page's advertised RSS/Atom `<link>`
+and includes the feed items, so live data can be read without any per-site tool.
+After **3 consecutive failed web calls** the harness injects a nudge
 ("answer with what you know, state what is unverified") and refuses further
 fetches; after 5 it ends the turn rather than letting the model guess dozens of
 URLs. `enable_thinking` is off to avoid the reasoning loops measured with
