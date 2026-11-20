@@ -94,8 +94,12 @@ the status bar shows `SCROLLED +N` while you are reading older messages.
 `--tui` is the default and is still accepted as a flag for the README and
 desktop shortcut.
 
-Assistant replies are rendered as **Markdown** instead of raw text: fenced code
-blocks get a dark background (`48;5;236`) and a small built-in highlighter
+Assistant replies are rendered as **Markdown** instead of raw text, and arrive
+**token by token** in the TUI (real SSE streaming, not a fake delay). Tool-call
+JSON is intentionally not typed out: only the final prose answer animates.
+
+Fenced code blocks get a dark background (`48;5;236`) and a small built-in
+highlighter
 (keywords, strings, comments, numbers, `diff` +/-) for rust, python, js/ts,
 json, shell and friends; inline code is amber (`38;5;222`), `**bold**` is bold,
 `*italic*` is italic, headings are bold blue, list items get a `-` indent, `>`
@@ -180,7 +184,9 @@ slot. A 404/5xx is returned with
 its URL and body so the model can try the next link instead of answering from
 memory. When a page turns out to be a JavaScript shell (CSS/JS leaked into the
 extracted text), `web.fetch` follows the page's advertised RSS/Atom `<link>`
-and includes the feed items, so live data can be read without any per-site tool.
+and includes the feed items; if that still yields no prose it falls back to a
+keyless reader service that renders JS-heavy pages as plain markdown. Live data
+and news headlines can be read without any per-site tool.
 After **3 consecutive failed web calls** the harness injects a nudge
 ("answer with what you know, state what is unverified") and refuses further
 fetches; after 5 it ends the turn rather than letting the model guess dozens of
