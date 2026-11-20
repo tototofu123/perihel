@@ -108,9 +108,10 @@ The input line is a real line editor, not append-only: **Ctrl+W** deletes the
 word before the cursor, **Ctrl+U** clears to the start, **Ctrl+K** kills to the
 end, **Ctrl+A**/**Ctrl+E** jump to start/end, **Ctrl+Left/Right** (or
 **Alt+Left/Right**) move a word at a time, and Home/End/Delete behave as
-expected. When the slash menu is closed, **Up**/**Down** walk the prompts you
-typed this session; editing a recalled line keeps it as your draft, and typing
-`/` brings the menu back.
+**Up/Down** scroll the conversation one line at a time when the slash menu is
+closed (the status bar shows `SCROLLED +N`); while the menu is open they move the
+`>` pointer. **Ctrl+Up/Ctrl+Down** (or Alt) walk prompts from this session;
+editing a recalled line keeps it as your draft. **PgUp/PgDn** scroll by a screen.
 
 ## Memory
 

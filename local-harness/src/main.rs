@@ -1884,7 +1884,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[derive(Debug)]
 enum Key {
-    Char(char, bool), Enter, Left(bool), Right(bool), Up, Down, Backspace, BackspaceWord,
+    Char(char, bool), Enter, Left(bool), Right(bool), Up(bool), Down(bool), Backspace, BackspaceWord,
     Delete, Home, End, Esc, PageUp, PageDown, Other,
 }
 
@@ -1908,8 +1908,8 @@ fn read_key() -> Key {
                 KeyCode::Enter => Key::Enter,
                 KeyCode::Left => Key::Left(word),
                 KeyCode::Right => Key::Right(word),
-                KeyCode::Up => Key::Up,
-                KeyCode::Down => Key::Down,
+                KeyCode::Up => Key::Up(word),
+                KeyCode::Down => Key::Down(word),
                 KeyCode::Backspace if ctrl => Key::BackspaceWord,
                 KeyCode::Backspace => Key::Backspace,
                 KeyCode::Delete => Key::Delete,
@@ -1970,8 +1970,28 @@ fn next_word(s: &str, pos: usize) -> usize {
     i
 }
 
-/// Prompts typed during this session, oldest first. Up/Down walk it when the
-/// slash menu is not showing, like a shell.
+/// Up/Down should scroll the conversation by default. The slash menu gets
+/// arrow navigation while it is open, and prompt recall is on Ctrl/Cmd+Up/Down
+/// so it can no longer hijack the input box when someone tries to read context.
+#[derive(Debug, PartialEq, Eq)]
+enum UpDownAction { MenuCursor(isize), Scroll(isize), HistoryPrev, HistoryNext }
+
+fn updown_action(menu_open: bool, modifier: bool, up: bool) -> UpDownAction {
+    if menu_open && !modifier {
+        UpDownAction::MenuCursor(if up { -1 } else { 1 })
+    } else if modifier {
+        if up { UpDownAction::HistoryPrev } else { UpDownAction::HistoryNext }
+    } else {
+        UpDownAction::Scroll(if up { 1 } else { -1 }) // +1 = older lines
+    }
+}
+
+fn scroll_lines(app: &mut App, delta: isize) {
+    if delta > 0 { app.scroll = app.scroll.saturating_add(delta as usize).min(10_000); }
+    else { app.scroll = app.scroll.saturating_sub(delta.unsigned_abs()); }
+}
+
+/// Prompts typed during this session, oldest first. Ctrl+Up/Down walk it.
 fn prompt_history() -> &'static Mutex<Vec<String>> {
     static HISTORY: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
     HISTORY.get_or_init(|| Mutex::new(Vec::new()))
@@ -2141,11 +2161,11 @@ fn main() {
                 if app.picking_session {
                     app.draw_session_picker();
                     match read_key() {
-                        Key::Down | Key::Char('j', false) => {
+                        Key::Down(_) | Key::Char('j', false) => {
                             let n = app.session_list.len().saturating_sub(1);
                             app.session_cursor = (app.session_cursor + 1).min(n);
                         }
-                        Key::Up | Key::Char('k', false) => {
+                        Key::Up(_) | Key::Char('k', false) => {
                             app.session_cursor = app.session_cursor.saturating_sub(1);
                         }
                         Key::Char(c, false) if c.is_ascii_digit() => {
@@ -2173,11 +2193,11 @@ fn main() {
                 if app.picking_model {
                     app.draw_picker();
                     match read_key() {
-                        Key::Down | Key::Char('j', false) => {
+                        Key::Down(_) | Key::Char('j', false) => {
                             let n = app.model_list.len().saturating_sub(1);
                             app.model_cursor = (app.model_cursor + 1).min(n);
                         }
-                        Key::Up | Key::Char('k', false) => {
+                        Key::Up(_) | Key::Char('k', false) => {
                             app.model_cursor = app.model_cursor.saturating_sub(1);
                         }
                         Key::Char(c, false) if c.is_ascii_digit() => {
@@ -2217,46 +2237,47 @@ fn main() {
                     app.draw_cursor(&buf, cursor);
                     match read_key() {
                         Key::Char('c', true) => break 'outer,
-                        Key::Down => {
-                            let matches = command_matches(&buf);
-                            if matches.is_empty() {
-                                if let Some(i) = hist_pos {
-                                    let next = {
+                        key @ (Key::Down(_) | Key::Up(_)) => {
+                            let up = matches!(key, Key::Up(_));
+                            let modifier = match key { Key::Up(w) | Key::Down(w) => w, _ => false };
+                            let menu_open = !command_matches(&buf).is_empty();
+                            match updown_action(menu_open, modifier, up) {
+                                UpDownAction::MenuCursor(delta) => {
+                                    let n = command_matches(&buf).len().saturating_sub(1) as isize;
+                                    app.suggest_cursor = (app.suggest_cursor as isize + delta).clamp(0, n) as usize;
+                                }
+                                UpDownAction::Scroll(delta) => scroll_lines(&mut app, delta),
+                                UpDownAction::HistoryNext => {
+                                    if let Some(i) = hist_pos {
+                                        let next = {
+                                            let hist = prompt_history().lock().unwrap();
+                                            if i + 1 < hist.len() { Some(hist[i + 1].clone()) } else { None }
+                                        };
+                                        match next {
+                                            Some(line) => { hist_pos = Some(i + 1); buf = line; }
+                                            None => { hist_pos = None; buf = draft.clone(); }
+                                        }
+                                        cursor = buf.len();
+                                    }
+                                }
+                                UpDownAction::HistoryPrev => {
+                                    let target = {
                                         let hist = prompt_history().lock().unwrap();
-                                        if i + 1 < hist.len() { Some(hist[i + 1].clone()) } else { None }
+                                        match hist_pos {
+                                            None if !hist.is_empty() => Some(hist.len() - 1),
+                                            Some(0) => Some(0),
+                                            Some(i) => Some(i - 1),
+                                            None => None,
+                                        }
+                                        .map(|i| (i, hist[i].clone()))
                                     };
-                                    match next {
-                                        Some(line) => { hist_pos = Some(i + 1); buf = line; }
-                                        None => { hist_pos = None; buf = draft.clone(); }
+                                    if let Some((i, line)) = target {
+                                        if hist_pos.is_none() { draft = buf.clone(); }
+                                        hist_pos = Some(i);
+                                        buf = line;
+                                        cursor = buf.len();
                                     }
-                                    cursor = buf.len();
                                 }
-                            } else {
-                                let n = matches.len().saturating_sub(1);
-                                app.suggest_cursor = (app.suggest_cursor + 1).min(n);
-                            }
-                        }
-                        Key::Up => {
-                            let matches = command_matches(&buf);
-                            if matches.is_empty() {
-                                let target = {
-                                    let hist = prompt_history().lock().unwrap();
-                                    match hist_pos {
-                                        None if !hist.is_empty() => Some(hist.len() - 1),
-                                        Some(0) => Some(0),
-                                        Some(i) => Some(i - 1),
-                                        None => None,
-                                    }
-                                    .map(|i| (i, hist[i].clone()))
-                                };
-                                if let Some((i, line)) = target {
-                                    if hist_pos.is_none() { draft = buf.clone(); }
-                                    hist_pos = Some(i);
-                                    buf = line;
-                                    cursor = buf.len();
-                                }
-                            } else {
-                                app.suggest_cursor = app.suggest_cursor.saturating_sub(1);
                             }
                         }
                         Key::Char('\t', false) => {
@@ -2768,6 +2789,33 @@ mod layout_tests {
         assert_eq!(read_memory(&ws.join("MEMORY.md")).unwrap().matches("- ").count(), 2);
         assert!(read_memory(&ws.join("missing.md")).is_none());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn up_down_behaviour_is_scroll_first() {
+        assert_eq!(updown_action(false, false, true), UpDownAction::Scroll(1));
+        assert_eq!(updown_action(false, false, false), UpDownAction::Scroll(-1));
+        assert_eq!(updown_action(true, false, true), UpDownAction::MenuCursor(-1));
+        assert_eq!(updown_action(true, false, false), UpDownAction::MenuCursor(1));
+        assert_eq!(updown_action(false, true, true), UpDownAction::HistoryPrev);
+        assert_eq!(updown_action(false, true, false), UpDownAction::HistoryNext);
+        assert_eq!(updown_action(true, true, true), UpDownAction::HistoryPrev);
+
+        let mut app = App {
+            client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            root: PathBuf::from("."),
+            max_rounds: 0, tui: true, round: 0, history: vec![],
+            picking_model: false, model_list: vec![], model_cursor: 0,
+            picking_session: false, session_list: vec![], session_cursor: 0,
+            session_id: "t".to_string(), busy: false, scroll: 0, suggest_cursor: 0,
+            sidecar: Sidecar::new("http://127.0.0.1:1", Path::new(".")),
+        };
+        scroll_lines(&mut app, 3);
+        assert_eq!(app.scroll, 3);
+        scroll_lines(&mut app, -2);
+        assert_eq!(app.scroll, 1);
+        scroll_lines(&mut app, -10);
+        assert_eq!(app.scroll, 0, "never scroll above the newest line");
     }
 
     #[test]
