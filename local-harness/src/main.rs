@@ -136,6 +136,9 @@ struct Client {
     agent: ureq::Agent,
     thinking: bool,
     last_stats: String,
+    /// Reasoning captured from a streamed reply when the model put the answer
+    /// there instead of in `content`.
+    last_reasoning: String,
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -237,7 +240,7 @@ impl Client {
             .timeout_global(Some(Duration::from_secs(900)))
             .build();
         let agent = ureq::Agent::new_with_config(config);
-        Self { base: base.trim_end_matches('/').to_string(), model: model.to_string(), grammar, messages, agent, thinking, last_stats: String::new() }
+        Self { base: base.trim_end_matches('/').to_string(), model: model.to_string(), grammar, messages, agent, thinking, last_stats: String::new(), last_reasoning: String::new() }
     }
 
     fn reset(&mut self) {
@@ -270,9 +273,8 @@ impl Client {
         out
     }
 
-    fn chat(&mut self, stream: bool) -> Result<String, String> {
-        let started = Instant::now();
-        let mut body = json!({
+    fn completion_body(&self, stream: bool) -> Value {
+        json!({
             "model": self.model,
             "messages": self.messages,
             "temperature": 0.4,
@@ -282,7 +284,12 @@ impl Client {
             "max_tokens": if self.thinking { 8000 } else { 4096 },
             "stream": stream,
             "chat_template_kwargs": {"enable_thinking": self.thinking},
-        });
+        })
+    }
+
+    fn chat(&mut self, stream: bool) -> Result<String, String> {
+        let started = Instant::now();
+        let mut body = self.completion_body(stream);
         if let Some(g) = &self.grammar {
             body["grammar"] = json!(g);
         }
@@ -316,6 +323,33 @@ impl Client {
         }
 
         // SSE: stream reasoning and content deltas as they arrive (typewriter).
+        let (mut full, tokens) = self.chat_sse(&mut |d| {
+            print!("{d}");
+            let _ = io::stdout().flush();
+        }, true)?;
+        let chars = full.len();
+        if full.is_empty() { full = std::mem::take(&mut self.last_reasoning); }
+        self.last_stats = stats_line(tokens, chars, started.elapsed());
+        print_stats(tokens, chars, started.elapsed());
+        Ok(full)
+    }
+
+    /// TUI variant: deliver content deltas to the caller so it can repaint the
+    /// frame as tokens arrive, without printing raw JSON/escape codes to stdout.
+    fn chat_stream<F: FnMut(&str)>(&mut self, on_delta: &mut F) -> Result<String, String> {
+        let started = Instant::now();
+        let (mut full, tokens) = self.chat_sse(on_delta, false)?;
+        let chars = full.len();
+        if full.is_empty() { full = std::mem::take(&mut self.last_reasoning); }
+        self.last_stats = stats_line(tokens, chars, started.elapsed());
+        Ok(full)
+    }
+
+    fn chat_sse<F: FnMut(&str)>(&mut self, on_delta: &mut F, echo: bool) -> Result<(String, u64), String> {
+        let body = self.completion_body(true);
+        let url = format!("{}/v1/chat/completions", self.base);
+        let resp = self.agent.post(&url).send_json(body)
+            .map_err(|e| format!("llama-server unreachable at {}: {}", self.base, e))?;
         let reader = resp.into_body().into_reader();
         let mut full = String::new();
         let mut reasoning = String::new();
@@ -326,49 +360,43 @@ impl Client {
             if !line.starts_with("data:") { continue; }
             let data = line[5..].trim();
             if data == "[DONE]" { break; }
-            let piece: Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let piece: Value = match serde_json::from_str(data) { Ok(v) => v, Err(_) => continue };
             if let Some(t) = piece["usage"]["completion_tokens"].as_u64() { tokens = t; }
             let delta = &piece["choices"][0]["delta"];
-            // The chat template puts thinking in reasoning_content.
             let reasoning_delta = delta["reasoning_content"].as_str().unwrap_or("");
             if !reasoning_delta.is_empty() {
-                if !thinking_header {
+                if echo && !thinking_header {
                     print!("\n\x1b[2m[thinking] ");
                     thinking_header = true;
                 }
                 reasoning.push_str(reasoning_delta);
-                print!("\x1b[2m{reasoning_delta}\x1b[0m");
-                let _ = io::stdout().flush();
+                if echo {
+                    print!("\x1b[2m{reasoning_delta}\x1b[0m");
+                    let _ = io::stdout().flush();
+                }
             }
             let content = delta["content"].as_str().unwrap_or("");
             if !content.is_empty() {
-                if thinking_header {
+                if echo && thinking_header {
                     print!("\x1b[0m\n");
                     thinking_header = false;
                 }
                 full.push_str(content);
-                // With a grammar attached every completion is a tool-call JSON
-                // document, so typing it out only to have the caller print the
-                // parsed reply afterwards shows the same text twice. Stream it
-                // only when the grammar is off (free-form prose).
-                if self.grammar.is_none() {
-                    print!("{content}");
+                // Always notify the caller (the TUI filters tool-call JSON).
+                on_delta(content);
+                // With a grammar attached the streamed text is a tool-call JSON
+                // document, not prose: only echo it when there is no grammar.
+                if echo && self.grammar.is_none() {
                     let _ = io::stdout().flush();
                 }
             }
         }
-        if thinking_header { print!("\x1b[0m"); }
-        println!();
-        // Some llama.cpp builds route the grammar-constrained tool call into
-        // reasoning_content instead of content.
-        let chars = if full.is_empty() { reasoning.len() } else { full.len() + reasoning.len() };
-        if full.is_empty() { full = reasoning.clone(); }
-        self.last_stats = stats_line(tokens, chars, started.elapsed());
-        print_stats(tokens, chars, started.elapsed());
-        Ok(full)
+        if echo {
+            if thinking_header { print!("\x1b[0m"); }
+            println!();
+        }
+        self.last_reasoning = reasoning;
+        Ok((full, tokens))
     }
 }
 
@@ -1122,12 +1150,50 @@ fn find_feed_link(html: &str) -> Option<String> {
     None
 }
 
+fn strip_md(s: &str) -> String {
+    let mut s = s.to_string();
+    // Drop markdown images.
+    while let Some(i) = s.find("![") {
+        match s[i + 2..].find(')') {
+            Some(j) => { s.replace_range(i..i + 2 + j + 1, ""); }
+            None => break,
+        }
+    }
+    // Keep link labels, drop the URLs.
+    while let Some(i) = s.find('[') {
+        if let Some(k) = s[i..].find("](") {
+            if let Some(j) = s[i + k + 2..].find(')') {
+                let label = s[i + 1..i + k].to_string();
+                s.replace_range(i..i + k + 2 + j + 1, &label);
+                continue;
+            }
+        }
+        break;
+    }
+    s
+}
+
+fn reader_text(body: &str) -> String {
+    strip_md(body)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty()
+            && !l.starts_with("Title:")
+            && !l.starts_with("URL Source:")
+            && !l.starts_with("Markdown Content:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn looks_like_js_shell(text: &str) -> bool {
-    // A rendered page usually has prose; a JS shell leaks CSS/JS into the
-    // readable-text extractor instead.
-    let markers = ["function ", "var ", "display:", "!important", "$(function", "/*", "window.open"];
-    let hits = markers.iter().filter(|m| text.contains(**m)).count();
-    hits >= 2 || text.chars().count() < 500
+    // Minified JS rarely has "function " with a space, so match the compact
+    // forms too. Strong markers alone are enough to bail out.
+    let strong = ["(function", "function(){", "localStorage", "document.documentElement",
+                  "window.dataLayer", "tw-border-spacing", "classList.add"];
+    let weak = ["function ", "var ", "display:", "!important", "$(function", "/*", "window.open"];
+    let strong_hits = strong.iter().filter(|m| text.contains(**m)).count();
+    let weak_hits = weak.iter().filter(|m| text.contains(**m)).count();
+    strong_hits >= 1 || weak_hits >= 2 || text.chars().count() < 500
 }
 
 fn parse_feed_items(body: &str) -> Vec<String> {
@@ -1198,6 +1264,15 @@ fn web_fetch(args: &Value) -> ToolResult {
             if let Some(feed) = read_feed(&link) {
                 out.push_str("\n\n");
                 out.push_str(&feed);
+            }
+        }
+        // Last resort: a keyless reader service renders JS-heavy pages (news
+        // timelines, SPAs) into markdown that the model can actually read.
+        let reader = format!("https://r.jina.ai/{url}");
+        if let Ok((200, body)) = http_get_status(&reader, 25) {
+            let readable = reader_text(&body);
+            if readable.chars().count() > out.chars().count() + 100 {
+                out = truncate_chars(&readable, 6000);
             }
         }
     }
@@ -1362,9 +1437,11 @@ impl Sidecar {
         self.probe.get(&format!("{}/health", self.base)).call().is_ok()
     }
 
-    /// True when a server with this exact model is already up.
+    /// True when a server with this exact model is already up. A server we
+    /// adopted from outside has no Child handle, but it must still count as
+    /// loaded or every turn prints "starting model" again.
     fn is_loaded(&self, model: &str) -> bool {
-        self.model == model && self.child.is_some()
+        self.model == model && (self.child.is_some() || self.healthy())
     }
 
     fn ensure(&mut self, model: &str) -> Result<(), String> {
@@ -1615,7 +1692,33 @@ impl App {
             if self.tui { self.draw(""); } else { println!("[round {}] thinking...", round); }
             self.busy = true;
             if self.tui { self.draw(""); }
-            let raw = match self.client.chat(!self.tui) {
+            let streamed = if self.tui {
+                // Take the client out so the delta callback can repaint `self`
+                // while the SSE loop runs (real typewriter, not a fake delay).
+                let base = self.client.base.clone();
+                let model = self.client.model.clone();
+                let grammar = self.client.grammar.clone();
+                let thinking = self.client.thinking;
+                let mut client = std::mem::replace(
+                    &mut self.client,
+                    Client::new(&base, &model, grammar, thinking),
+                );
+                let mut partial = String::new();
+                let (cols, rows) = term_size();
+                let result = client.chat_stream(&mut |delta| {
+                    partial.push_str(delta);
+                    // With a grammar the stream is the tool-call JSON, not the
+                    // answer; only type out prose.
+                    if partial.trim_start().starts_with('{') { return; }
+                    print!("{}", self.frame_inner("", 0, cols, rows, Some(&partial)));
+                    let _ = io::stdout().flush();
+                });
+                self.client = client;
+                result
+            } else {
+                self.client.chat(true)
+            };
+            let raw = match streamed {
                 Ok(r) => r,
                 Err(e) => {
                     self.busy = false;
@@ -1741,6 +1844,10 @@ impl App {
     /// Build one full screen frame. Kept separate from drawing so layout can be
     /// unit-tested at a fixed size.
     fn frame_with_size(&self, input: &str, cursor: usize, cols: usize, rows: usize) -> String {
+        self.frame_inner(input, cursor, cols, rows, None)
+    }
+
+    fn frame_inner(&self, input: &str, cursor: usize, cols: usize, rows: usize, stream: Option<&str>) -> String {
         let q = input.trim_start();
         let suggestions = command_matches(q);
         let sel = self.suggest_cursor.min(suggestions.len().saturating_sub(1));
@@ -1780,6 +1887,13 @@ impl App {
                 lines.push(format!("{}{}", if i == 0 { prefix } else { cont }, seg));
             }
             last_kind = Some(kind);
+        }
+        if let Some(partial) = stream {
+            if !partial.trim().is_empty() {
+                for (i, seg) in markdown::render(partial, cols.saturating_sub(3)).iter().enumerate() {
+                    lines.push(format!("{}{}", if i == 0 { "\x1b[1;36m*\x1b[0m " } else { "  " }, seg));
+                }
+            }
         }
         if self.busy {
             lines.push("\x1b[33m*\x1b[0m generating... (Ctrl+C stops)".to_string());
@@ -2466,6 +2580,7 @@ fn main() {
 #[cfg(test)]
 mod tool_tests {
     use super::*;
+    use std::io::Read;
 
     fn python_available() -> bool {
         Command::new("python").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
@@ -2492,6 +2607,76 @@ mod tool_tests {
         assert_eq!(items.len(), 1);
         assert!(items[0].contains("13 degrees Celsius"), "{:?}", items);
         assert!(items[0].contains("91 per cent"), "{:?}", items);
+    }
+
+    #[test]
+    fn reader_fallback_produces_plain_text() {
+        let body = "Title: x\nURL Source: y\nMarkdown Content:\n![Image 1](a.png)## [Headline](https://x)\n* [BBC](https://bbc.com) 4 hours ago\n";
+        let text = reader_text(body);
+        assert!(text.contains("## Headline"), "{text:?}");
+        assert!(text.contains("BBC"), "{text:?}");
+        assert!(!text.contains("![Image"), "{text:?}");
+        assert!(!text.contains("https://x"), "{text:?}");
+        assert!(!text.contains("Title:"), "{text:?}");
+    }
+
+    #[test]
+    fn adopted_server_counts_as_loaded() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf);
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let mut sidecar = Sidecar::new(&format!("http://127.0.0.1:{port}"), Path::new("."));
+        sidecar.model = "fake".to_string();
+        assert!(sidecar.is_loaded("fake"), "adopted server must not re-print 'starting model' each turn");
+        assert!(!sidecar.is_loaded("other"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn chat_stream_delivers_deltas_before_the_full_reply() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let mut received = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 { break; }
+                received.extend_from_slice(&buf[..n]);
+                let s = String::from_utf8_lossy(&received);
+                if s.contains("\r\n\r\n") && s.trim_end().ends_with('}') { break; }
+            }
+            let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            sock.write_all(headers).unwrap();
+            let sse = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n\
+                        data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n\
+                        data: [DONE]\n\n";
+            sock.write_all(sse).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut client = Client::new(&format!("http://127.0.0.1:{port}"), "fake", Some("g".into()), false);
+        client.messages.push(json!({"role": "user", "content": "hi"}));
+        let mut seen = String::new();
+        let full = client.chat_stream(&mut |d| seen.push_str(d)).unwrap();
+        assert_eq!(full, "Hello");
+        assert_eq!(seen, "Hello", "the TUI callback gets each delta as it arrives");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn js_shell_detection_catches_minified_code() {
+        assert!(looks_like_js_shell("(function(){try{var d=document.documentElement"));
+        assert!(looks_like_js_shell("window.dataLayer = window.dataLayer || [];"));
+        assert!(!looks_like_js_shell(&"The quick brown fox jumps over the lazy dog. ".repeat(20)));
     }
 
     #[test]
