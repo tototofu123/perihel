@@ -67,8 +67,11 @@ Typing `/` in the TUI opens a live **command menu**. Up/Down (or `j`/`k`) move
 the `>` pointer, **Tab** completes the highlighted command, and **Enter** runs
 it (opencode/oh-my-pi style). Typing filters the list; the menu resets when the
 text changes. `/session` opens a session browser with a `>` pointer over saved
-conversations (`~/.perihel/sessions/`); Enter restores one, and `/session <n>`
-does the same from the CLI. Every turn is saved automatically.
+conversations (`~/.perihel/sessions/`). **Click a row with the mouse to open it
+immediately**, or use arrows/`j`/`k`, type an index (digits accumulate, so `29`
+means session 29; Tab confirms), and press Enter. Restoring rebuilds the whole
+visible conversation — the past turns appear in the TUI, not just a
+"session restored" message. Every turn is saved automatically.
 
 When no `--model` is given, the first available model is auto-selected instead
 of the `local-model` placeholder. llama.cpp reports the full GGUF path, so the
