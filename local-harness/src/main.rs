@@ -1866,8 +1866,16 @@ impl App {
                                 && matches!(k.code, KeyCode::Char('c'))
                             {
                                 INTERRUPTED.store(true, Ordering::SeqCst);
-                            } else if let KeyCode::Char(c) = k.code {
-                                pending_input().lock().unwrap().push(c);
+                            } else {
+                                // Keep the whole keystroke so Enter/Backspace
+                                // typed during generation still work later.
+                                let ch = match k.code {
+                                    KeyCode::Char(c) => Some(c),
+                                    KeyCode::Enter => Some('\r'),
+                                    KeyCode::Backspace => Some('\u{8}'),
+                                    _ => None,
+                                };
+                                if let Some(ch) = ch { pending_input().lock().unwrap().push(ch); }
                             }
                         }
                     }
@@ -2642,7 +2650,15 @@ fn main() {
                 }
 
                 // Full-screen line editor with a visible block cursor.
-                let mut buf: String = pending_input().lock().unwrap().drain(..).collect();
+                let mut queued_enter = false;
+                let mut buf = String::new();
+                for ch in pending_input().lock().unwrap().drain(..) {
+                    match ch {
+                        '\r' => { queued_enter = true; break; }
+                        '\u{8}' => { buf.pop(); }
+                        other => buf.push(other),
+                    }
+                }
                 let mut cursor = buf.len();
                 // Shell-style history walk: None means "editing a fresh line".
                 let mut hist_pos: Option<usize> = None;
@@ -2650,6 +2666,9 @@ fn main() {
                 app.suggest_cursor = 0;
                 loop {
                     app.draw_cursor(&buf, cursor);
+                    if queued_enter {
+                        break;
+                    }
                     match read_key() {
                         Key::Char('c', true) => break 'outer,
                         key @ (Key::Down(_) | Key::Up(_)) => {
@@ -2924,10 +2943,19 @@ mod tool_tests {
         pending_input().lock().unwrap().clear();
         {
             let mut p = pending_input().lock().unwrap();
-            p.push('h'); p.push('i');
+            p.extend("hello\u{8}hi\r".chars()); // backspace removes the 'o'
         }
-        let drained: String = pending_input().lock().unwrap().drain(..).collect();
-        assert_eq!(drained, "hi");
+        let mut buf = String::new();
+        let mut queued_enter = false;
+        for ch in pending_input().lock().unwrap().drain(..) {
+            match ch {
+                '\r' => { queued_enter = true; break; }
+                '\u{8}' => { buf.pop(); }
+                other => buf.push(other),
+            }
+        }
+        assert_eq!(buf, "hellhi");
+        assert!(queued_enter, "Enter typed during generation must still submit the line");
         assert!(pending_input().lock().unwrap().is_empty());
     }
 
