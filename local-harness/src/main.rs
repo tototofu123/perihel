@@ -6,7 +6,7 @@
 //! There is no fixed round limit: Ctrl+C stops at any time.
 
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, EnableMouseCapture, DisableMouseCapture, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::terminal::enable_raw_mode;
 use serde_json::{json, Value};
 use std::fs;
@@ -791,6 +791,35 @@ fn load_session(client: &mut Client, path: &Path) -> Result<(), String> {
     let file: SessionFile = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     client.messages = file.messages;
     Ok(())
+}
+
+/// Rebuild the visible conversation from the stored messages so restoring a
+/// session actually shows its turns instead of only printing "session restored".
+fn history_from_messages(messages: &[Value]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for m in messages {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        match role {
+            "user" if content.starts_with("TOOL RESULT") => {
+                let first = content.lines().nth(1).unwrap_or("").trim();
+                out.push(("tool".into(), truncate_chars(first, 160)));
+            }
+            "user" => out.push(("user".into(), content.to_string())),
+            "assistant" => {
+                if let Some(call) = parse_call(content) {
+                    if call["tool"].as_str() == Some("reply.text") {
+                        let text = call["args"]["text"].as_str().unwrap_or("").to_string();
+                        out.push(("assistant".into(), text));
+                    }
+                } else {
+                    out.push(("assistant".into(), assistant_display(content)));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 // ------------------------------------------------------------------ web tools
@@ -1934,12 +1963,30 @@ impl App {
         let _ = io::stdout().flush();
     }
 
-    fn draw_session_picker(&self) {
+    fn restore_session(&mut self, path: &Path) {
+        match load_session(&mut self.client, path) {
+            Ok(()) => {
+                let history = history_from_messages(&self.client.messages);
+                let turns = history.iter().filter(|(k, _)| k == "user").count();
+                self.history = history;
+                self.round = turns;
+                self.scroll = 0;
+                self.busy = false;
+                self.picking_session = false;
+                self.inform(&format!("session restored - {} turns", turns));
+            }
+            Err(e) => self.inform(&format!("session load failed: {e}")),
+        }
+    }
+
+    fn draw_session_picker(&self, typed: &str) {
         let (cols, _) = term_size();
         let mut out = String::from("\x1b[H\x1b[2J");
         out.push_str("\x1b[48;5;24m\x1b[97m SESSIONS \x1b[0m  recent conversations\x1b[0m\n");
         out.push_str(&format!("{}\x1b[0K\n", "-".repeat(cols.saturating_sub(1))));
-        out.push_str("  arrows / j k : move   number : jump   Enter : restore   q : cancel\n\n");
+        out.push_str("  arrows / j k : move   number : jump (type 2 digits for 10+)   Enter : restore   click : open   q : cancel\n");
+        out.push_str(&format!("  jump: {typed}_\n")); // always one row (stable click targets)
+        out.push_str("\n");
         if self.session_list.is_empty() {
             out.push_str("  (no saved sessions yet - chat a little first)\n");
         }
@@ -2148,7 +2195,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 #[derive(Debug)]
 enum Key {
     Char(char, bool), Enter, Left(bool), Right(bool), Up(bool), Down(bool), Backspace, BackspaceWord,
-    Delete, Home, End, Esc, PageUp, PageDown, Other,
+    Delete, Home, End, Esc, PageUp, PageDown, Click(usize, usize), Other,
 }
 
 /// Read one key in raw mode. Raw mode is disabled again before returning, so
@@ -2163,6 +2210,13 @@ fn read_key() -> Key {
         };
     }
     loop {
+        if let Ok(Event::Mouse(m)) = event::read() {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                let _ = crossterm::terminal::disable_raw_mode();
+                return Key::Click(m.column as usize, m.row as usize);
+            }
+            continue;
+        }
         if let Ok(Event::Key(k)) = event::read() {
             if k.kind != KeyEventKind::Press { continue; }
             let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -2410,6 +2464,7 @@ fn main() {
 
     if app.tui {
         print!("\x1b[?1049h\x1b[?25l");
+    let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
         let _ = io::stdout().flush();
     }
 
@@ -2423,8 +2478,11 @@ fn main() {
             let cmd: String;
             if app.tui {
                 if app.picking_session {
-                    app.draw_session_picker();
-                    match read_key() {
+                    let mut digits = String::new();
+                    let mut digit_at = Instant::now();
+                    loop {
+                        app.draw_session_picker(&digits);
+                        match read_key() {
                         Key::Down(_) | Key::Char('j', false) => {
                             let n = app.session_list.len().saturating_sub(1);
                             app.session_cursor = (app.session_cursor + 1).min(n);
@@ -2433,17 +2491,39 @@ fn main() {
                             app.session_cursor = app.session_cursor.saturating_sub(1);
                         }
                         Key::Char(c, false) if c.is_ascii_digit() => {
-                            let i = c.to_digit(10).unwrap_or(0) as usize;
-                            if i < app.session_list.len() { app.session_cursor = i; }
+                            if digit_at.elapsed() > Duration::from_secs(2) { digits.clear(); }
+                            digit_at = Instant::now();
+                            digits.push(c);
+                            if digits.len() > 3 { digits.remove(0); }
+                            if let Ok(i) = digits.parse::<usize>() {
+                                if i < app.session_list.len() { app.session_cursor = i; }
+                            }
+                        }
+                        Key::Char('\t', false) => {
+                            // Tab completes the number immediately.
+                            if let Ok(i) = digits.parse::<usize>() {
+                                if i < app.session_list.len() { app.session_cursor = i; }
+                            }
+                            digits.clear();
+                        }
+                        Key::Click(_col, row) => {
+                            // Picker rows: 0 header, 1 separator, 2 keys,
+                            // 3 jump line, 4 blank, 5+ are sessions.
+                            let idx = row.saturating_sub(5);
+                            if idx < app.session_list.len() {
+                                app.session_cursor = idx;
+                                let path = app.session_list[idx].0.clone();
+                                app.restore_session(&path);
+                                break;
+                            }
                         }
                         Key::Enter => {
                             if let Some((path, _)) = app.session_list.get(app.session_cursor).cloned() {
-                                match load_session(&mut app.client, &path) {
-                                    Ok(()) => app.inform("session restored"),
-                                    Err(e) => app.inform(&format!("session load failed: {e}")),
-                                }
+                                app.restore_session(&path);
+                            } else {
+                                app.picking_session = false;
                             }
-                            app.picking_session = false;
+                            break;
                         }
                         Key::Esc | Key::Char('q', false) => {
                             app.picking_session = false;
@@ -2451,6 +2531,7 @@ fn main() {
                         }
                         Key::Char('c', true) => break 'outer,
                         _ => {}
+                    }
                     }
                     continue;
                 }
@@ -2658,10 +2739,7 @@ fn main() {
                             let sessions = list_sessions();
                             if let Ok(i) = rest.trim().parse::<usize>() {
                                 if let Some((path, _)) = sessions.get(i) {
-                                    match load_session(&mut app.client, path) {
-                                        Ok(()) => app.inform("session restored"),
-                                        Err(e) => app.inform(&format!("session load failed: {e}")),
-                                    }
+                                    app.restore_session(path);
                                 } else { app.inform("session index out of range"); }
                             }
                             continue;
@@ -2672,7 +2750,7 @@ fn main() {
                             app.inform("no saved sessions yet");
                         } else {
                             app.picking_session = true;
-                            if app.tui { app.draw_session_picker(); }
+                            if app.tui { app.draw_session_picker(""); }
                             else {
                                 for (i, (_, title)) in app.session_list.iter().enumerate() {
                                     println!("  [{i}] {title}");
@@ -2714,7 +2792,8 @@ fn main() {
     app.sidecar.stop();   // llama-server lives only as long as this harness
 
     if app.tui {
-        print!("\x1b[?25h\x1b[?1049l");
+        let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
+    print!("\x1b[?25h\x1b[?1049l");
         let _ = io::stdout().flush();
     }
 }
@@ -2749,6 +2828,37 @@ mod tool_tests {
         assert_eq!(items.len(), 1);
         assert!(items[0].contains("13 degrees Celsius"), "{:?}", items);
         assert!(items[0].contains("91 per cent"), "{:?}", items);
+    }
+
+    #[test]
+    fn restored_sessions_rebuild_visible_history() {
+        let messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "what is 2+2"}),
+            json!({"role": "assistant", "content": "```json\n{\"tool\":\"reply.text\",\"args\":{\"text\":\"four\"}}\n```"}),
+            json!({"role": "user", "content": "TOOL RESULT (OK):\nweb.search -> a result"}),
+            json!({"role": "user", "content": "and 3+3?"}),
+            json!({"role": "assistant", "content": "{\"tool\":\"reply.text\",\"args\":{\"text\":\"six\"}}"}),
+        ];
+        let h = history_from_messages(&messages);
+        assert_eq!(h.len(), 5);
+        assert_eq!(h[0], ("user".to_string(), "what is 2+2".to_string()));
+        assert_eq!(h[1], ("assistant".to_string(), "four".to_string()));
+        assert_eq!(h[2], ("tool".to_string(), "web.search -> a result".to_string()));
+        assert_eq!(h[3].0, "user");
+        assert_eq!(h[4], ("assistant".to_string(), "six".to_string()));
+    }
+
+    #[test]
+    fn multi_digit_jump_buffer_accumulates() {
+        // The picker keeps digits until a 2 s pause; 2 then 9 means index 29.
+        let mut digits = String::new();
+        for c in "29".chars() { digits.push(c); }
+        assert_eq!(digits.parse::<usize>().unwrap(), 29);
+        // A third digit is dropped from the front to keep the buffer small.
+        digits.push('5');
+        if digits.len() > 3 { digits.remove(0); }
+        assert_eq!(digits, "295");
     }
 
     #[test]
