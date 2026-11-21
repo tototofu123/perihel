@@ -1411,6 +1411,25 @@ fn strip_tool_json(partial: &str) -> &str {
     }
 }
 
+/// Text to show while a reply streams. With a grammar on, answers arrive as
+/// `{"tool":"reply.text","args":{"text":"..."}}`, so hiding the whole JSON also
+/// hides the answer and it appears in one chunk. Instead, pull the partially
+/// streamed `text` value out and type that; other tool calls stay hidden.
+fn stream_visible(partial: &str) -> String {
+    let trimmed = partial.trim_start();
+    let no_fence = trimmed.strip_prefix("```json").unwrap_or(trimmed).trim_start();
+    let no_fence = no_fence.strip_prefix("```").unwrap_or(no_fence).trim_start();
+    if no_fence.starts_with('{') {
+        if no_fence.contains("\"reply.text\"") || no_fence.contains("\"tool\"") {
+            if let Some(text) = json_string_after_key(no_fence, "text") {
+                return text;
+            }
+        }
+        return String::new(); // still receiving the tool name / other tool call
+    }
+    strip_tool_json(partial).to_string()
+}
+
 /// Pull a JSON string value out of `key`, tolerating escapes and a string that
 /// was cut off before its closing quote (stream truncated at max_tokens).
 fn json_string_after_key(s: &str, key: &str) -> Option<String> {
@@ -1786,12 +1805,10 @@ impl App {
                 let (cols, rows) = term_size();
                 let result = client.chat_stream(&mut |delta| {
                     partial.push_str(delta);
-                    // Hide any tool-call JSON while it streams: the model
-                    // often emits prose, then the {"tool": ...} call. Typing
-                    // the raw JSON and dropping it when the round ends reads
-                    // as the answer flickering between JSON and rendered
-                    // text. The JSON is never part of the answer.
-                    let visible = strip_tool_json(&partial);
+                    // For grammar-on replies the answer lives inside the
+                    // reply.text JSON, so stream that field as prose instead
+                    // of typing the JSON or dropping the answer entirely.
+                    let visible = stream_visible(&partial);
                     if visible.trim().is_empty() { return; }
                     // Throttle repaints: a full-frame redraw per token is
                     // what flashed the bottom of the screen. ~12 fps is
@@ -1801,7 +1818,7 @@ impl App {
                         return;
                     }
                     last_paint = Some(Instant::now());
-                    print!("{}", self.frame_inner("", 0, cols, rows, Some(visible)));
+                    print!("{}", self.frame_inner("", 0, cols, rows, Some(&visible)));
                     let _ = io::stdout().flush();
                 });
                 self.client = client;
@@ -2722,6 +2739,16 @@ mod tool_tests {
         assert_eq!(items.len(), 1);
         assert!(items[0].contains("13 degrees Celsius"), "{:?}", items);
         assert!(items[0].contains("91 per cent"), "{:?}", items);
+    }
+
+    #[test]
+    fn stream_visible_types_the_answer_not_the_json() {
+        assert_eq!(stream_visible("```json\n{\"tool\":\"reply.te"), "");
+        assert_eq!(stream_visible("{\"tool\":\"reply.text\",\"args\":{\"text\":\"Hel"), "Hel");
+        assert_eq!(stream_visible("{\"tool\":\"reply.text\",\"args\":{\"text\":\"Hello world\"}}"),
+                   "Hello world");
+        assert_eq!(stream_visible("{\"tool\":\"web.search\",\"args\":{\"query\":\"hi\"}}"), "");
+        assert_eq!(stream_visible("just prose"), "just prose");
     }
 
     #[test]
