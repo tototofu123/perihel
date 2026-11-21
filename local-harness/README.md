@@ -211,6 +211,14 @@ preferences). For greetings, a bare `test`, or a prompt with no concrete task,
 the model is told to answer with `reply.text` immediately - no tool calls and
 no notes about the conversation itself.
 
+**Subagents.** `task.run` delegates a self-contained subtask to a fresh agent
+process with an isolated context, the same model/server/workspace, 8 rounds
+max, and no ability to spawn further subagents. Only its final answer is
+returned to the parent, so a big research or verification task does not fill
+the main conversation with the subagent's tool chatter. Use it for work that
+stands on its own (e.g. "summarize this repo and list the test commands");
+do not use it for something that needs the current conversation's context.
+
 The allowlist covers the usual verification commands: `python script.py`,
 `python -m pytest|http.server|py_compile|json.tool`, `node`/`npm`/`npx`
 (`test`, `start`, `run <script>`, `build`, `tsc`, `vite`, `next`, ...), `cargo`
