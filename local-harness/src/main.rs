@@ -1857,26 +1857,36 @@ impl App {
                 let (cols, rows) = term_size();
                 let result = client.chat_stream(&mut |delta| {
                     partial.push_str(delta);
-                    // While generating, keep collecting keys so typing never
-                    // feels dropped, and let Ctrl+C interrupt the turn.
+                    // While generating, only Ctrl+C is handled now. Every
+                    // other key is deferred so the editor processes it later
+                    // in the same order it was typed (no half-written lines).
                     while event::poll(Duration::from_millis(0)).unwrap_or(false) {
                         if let Ok(Event::Key(k)) = event::read() {
                             if k.kind != KeyEventKind::Press { continue; }
-                            if k.modifiers.contains(KeyModifiers::CONTROL)
-                                && matches!(k.code, KeyCode::Char('c'))
-                            {
+                            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                            if ctrl && matches!(k.code, KeyCode::Char('c')) {
                                 INTERRUPTED.store(true, Ordering::SeqCst);
-                            } else {
-                                // Keep the whole keystroke so Enter/Backspace
-                                // typed during generation still work later.
-                                let ch = match k.code {
-                                    KeyCode::Char(c) => Some(c),
-                                    KeyCode::Enter => Some('\r'),
-                                    KeyCode::Backspace => Some('\u{8}'),
-                                    _ => None,
-                                };
-                                if let Some(ch) = ch { pending_input().lock().unwrap().push(ch); }
+                                continue;
                             }
+                            let word = ctrl || k.modifiers.contains(KeyModifiers::ALT);
+                            let key = match k.code {
+                                KeyCode::Enter => Key::Enter,
+                                KeyCode::Left => Key::Left(word),
+                                KeyCode::Right => Key::Right(word),
+                                KeyCode::Up => Key::Up(word),
+                                KeyCode::Down => Key::Down(word),
+                                KeyCode::Backspace if ctrl => Key::BackspaceWord,
+                                KeyCode::Backspace => Key::Backspace,
+                                KeyCode::Delete => Key::Delete,
+                                KeyCode::Home => Key::Home,
+                                KeyCode::End => Key::End,
+                                KeyCode::Esc => Key::Esc,
+                                KeyCode::PageUp => Key::PageUp,
+                                KeyCode::PageDown => Key::PageDown,
+                                KeyCode::Char(c) => Key::Char(c, ctrl),
+                                _ => Key::Other,
+                            };
+                            deferred_keys().lock().unwrap().push_back(key);
                         }
                     }
                     // For grammar-on replies the answer lives inside the
@@ -2241,14 +2251,17 @@ enum Key {
 /// mode), which made typing feel laggy and unresponsive.
 static RAW_MODE: AtomicBool = AtomicBool::new(false);
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-static PENDING_INPUT: OnceLock<Mutex<Vec<char>>> = OnceLock::new();
+static DEFERRED_KEYS: OnceLock<Mutex<VecDeque<Key>>> = OnceLock::new();
 
-fn pending_input() -> &'static Mutex<Vec<char>> {
-    PENDING_INPUT.get_or_init(|| Mutex::new(Vec::new()))
+fn deferred_keys() -> &'static Mutex<VecDeque<Key>> {
+    DEFERRED_KEYS.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-/// Read one key. Raw mode is already enabled for the whole TUI session.
+/// Read one key. Keys typed while a reply was streaming were deferred here by
+/// the stream callback, so the editor sees them in order exactly as if the
+/// user had typed them while idle (including Enter and Backspace).
 fn read_key() -> Key {
+    if let Some(k) = deferred_keys().lock().unwrap().pop_front() { return k; }
     if !RAW_MODE.load(Ordering::SeqCst) {
         let mut line = String::new();
         return match io::stdin().read_line(&mut line) {
@@ -2650,25 +2663,14 @@ fn main() {
                 }
 
                 // Full-screen line editor with a visible block cursor.
-                let mut queued_enter = false;
                 let mut buf = String::new();
-                for ch in pending_input().lock().unwrap().drain(..) {
-                    match ch {
-                        '\r' => { queued_enter = true; break; }
-                        '\u{8}' => { buf.pop(); }
-                        other => buf.push(other),
-                    }
-                }
-                let mut cursor = buf.len();
+                let mut cursor = 0usize;
                 // Shell-style history walk: None means "editing a fresh line".
                 let mut hist_pos: Option<usize> = None;
                 let mut draft = String::new();
                 app.suggest_cursor = 0;
                 loop {
                     app.draw_cursor(&buf, cursor);
-                    if queued_enter {
-                        break;
-                    }
                     match read_key() {
                         Key::Char('c', true) => break 'outer,
                         key @ (Key::Down(_) | Key::Up(_)) => {
@@ -2939,24 +2941,23 @@ mod tool_tests {
     }
 
     #[test]
-    fn typing_during_generation_is_buffered() {
-        pending_input().lock().unwrap().clear();
+    fn keys_typed_during_generation_are_deferred_in_order() {
+        deferred_keys().lock().unwrap().clear();
         {
-            let mut p = pending_input().lock().unwrap();
-            p.extend("hello\u{8}hi\r".chars()); // backspace removes the 'o'
+            let mut q = deferred_keys().lock().unwrap();
+            q.push_back(Key::Char('t', false));
+            q.push_back(Key::Char('e', false));
+            q.push_back(Key::Backspace);
+            q.push_back(Key::Char('s', false));
+            q.push_back(Key::Enter);
         }
-        let mut buf = String::new();
-        let mut queued_enter = false;
-        for ch in pending_input().lock().unwrap().drain(..) {
-            match ch {
-                '\r' => { queued_enter = true; break; }
-                '\u{8}' => { buf.pop(); }
-                other => buf.push(other),
-            }
-        }
-        assert_eq!(buf, "hellhi");
-        assert!(queued_enter, "Enter typed during generation must still submit the line");
-        assert!(pending_input().lock().unwrap().is_empty());
+        // read_key() hands them to the editor in the original order.
+        assert!(matches!(read_key(), Key::Char('t', false)));
+        assert!(matches!(read_key(), Key::Char('e', false)));
+        assert!(matches!(read_key(), Key::Backspace));
+        assert!(matches!(read_key(), Key::Char('s', false)));
+        assert!(matches!(read_key(), Key::Enter));
+        assert!(deferred_keys().lock().unwrap().is_empty());
     }
 
     #[test]
