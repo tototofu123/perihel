@@ -1401,13 +1401,25 @@ fn execute(call: &Value, root: &Path) -> ToolResult {
 ///
 /// Only a `{` that opens with `"tool"` (allowing the string to still be
 /// streaming in) counts. A brace in code or prose stays visible.
-fn strip_tool_json(partial: &str) -> &str {
-    let Some(start) = partial.find('{') else { return partial };
+fn strip_tool_json(partial: &str) -> String {
+    let Some(start) = partial.find('{') else { return partial.to_string() };
     let after = partial[start + 1..].trim_start();
     if after.is_empty() || "\"tool\"".starts_with(after) || after.starts_with("\"tool\"") {
-        &partial[..start]
+        let prefix = partial[..start].trim_end();
+        let prefix = prefix.strip_suffix("```json").unwrap_or(prefix).trim_end();
+        let prefix = prefix.strip_suffix("```").unwrap_or(prefix).trim_end();
+        prefix.to_string()
     } else {
-        partial
+        partial.to_string()
+    }
+}
+
+/// Remove the markdown fence a model wraps around tool calls before storing
+/// the message in the conversation / session. Context keeps the JSON itself.
+fn clean_tool_message(raw: &str) -> String {
+    match (raw.find('{'), raw.rfind('}')) {
+        (Some(start), Some(end)) if end > start => raw[start..=end].to_string(),
+        _ => raw.trim().to_string(),
     }
 }
 
@@ -1416,18 +1428,16 @@ fn strip_tool_json(partial: &str) -> &str {
 /// hides the answer and it appears in one chunk. Instead, pull the partially
 /// streamed `text` value out and type that; other tool calls stay hidden.
 fn stream_visible(partial: &str) -> String {
-    let trimmed = partial.trim_start();
-    let no_fence = trimmed.strip_prefix("```json").unwrap_or(trimmed).trim_start();
-    let no_fence = no_fence.strip_prefix("```").unwrap_or(no_fence).trim_start();
-    if no_fence.starts_with('{') {
-        if no_fence.contains("\"reply.text\"") || no_fence.contains("\"tool\"") {
-            if let Some(text) = json_string_after_key(no_fence, "text") {
-                return text;
-            }
+    if partial.contains("\"reply.text\"") || partial.contains("\"tool\"") {
+        if let Some(text) = json_string_after_key(partial, "text") {
+            // Keep any prose the model wrote before the tool call, but drop
+            // the ```json fence and the JSON document itself.
+            let before = partial.find('{').map(|i| &partial[..i]).unwrap_or("");
+            let prefix = before.trim().trim_end_matches("```json").trim();
+            return if prefix.is_empty() { text } else { format!("{prefix}\n{text}") };
         }
-        return String::new(); // still receiving the tool name / other tool call
     }
-    strip_tool_json(partial).to_string()
+    strip_tool_json(partial)
 }
 
 /// Pull a JSON string value out of `key`, tolerating escapes and a string that
@@ -1850,7 +1860,7 @@ impl App {
                     return;
                 }
             };
-            self.client.messages.push(json!({"role":"assistant","content":raw}));
+            self.client.messages.push(json!({"role":"assistant","content":clean_tool_message(&raw)}));
             let name = call["tool"].as_str().unwrap_or("").to_string();
             if name == "reply.text" {
                 let text = call["args"]["text"].as_str().unwrap_or("").to_string();
@@ -2749,6 +2759,10 @@ mod tool_tests {
                    "Hello world");
         assert_eq!(stream_visible("{\"tool\":\"web.search\",\"args\":{\"query\":\"hi\"}}"), "");
         assert_eq!(stream_visible("just prose"), "just prose");
+        assert_eq!(stream_visible("Sure, here it is:\n```json\n{\"tool\":\"reply.text\",\"args\":{\"text\":\"answer\"}}"),
+                   "Sure, here it is:\nanswer");
+        assert_eq!(clean_tool_message("```json\n{\"tool\":\"reply.text\"}\n```"),
+                   "{\"tool\":\"reply.text\"}");
     }
 
     #[test]
@@ -2832,7 +2846,7 @@ mod tool_tests {
     #[test]
     fn stream_hides_tool_call_json_but_keeps_prose() {
         assert_eq!(strip_tool_json("hello"), "hello");
-        assert_eq!(strip_tool_json("Let me check. {\"tool\": \"web.fetch\""), "Let me check. ");
+        assert_eq!(strip_tool_json("Let me check. {\"tool\": \"web.fetch\""), "Let me check.");
         assert_eq!(strip_tool_json("{\"tool\": \"web.fetch\", \"args\": {}"), "");
         assert_eq!(strip_tool_json("{\"to"), "", "a half-streamed \"tool\" still counts");
         assert_eq!(strip_tool_json("Here is a struct { x: 1 }"), "Here is a struct { x: 1 }", "a brace in code stays visible");
