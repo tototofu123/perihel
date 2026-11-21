@@ -2262,7 +2262,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 #[derive(Debug)]
 enum Key {
     Char(char, bool), Enter, Left(bool), Right(bool), Up(bool), Down(bool), Backspace, BackspaceWord,
-    Delete, Home, End, Esc, PageUp, PageDown, Click(usize, usize), Other,
+    Delete, Home, End, Esc, PageUp, PageDown, Click(usize, usize), Resize, Other,
 }
 
 /// Raw mode stays on for the whole TUI session. Toggling it around each key
@@ -2306,34 +2306,38 @@ fn read_key() -> Key {
         };
     }
     loop {
-        if let Ok(Event::Mouse(m)) = event::read() {
-            if m.kind == MouseEventKind::Down(MouseButton::Left) {
-                return Key::Click(m.column as usize, m.row as usize);
+        match event::read() {
+            Ok(Event::Resize(_, _)) => return Key::Resize,
+            Ok(Event::Mouse(m)) => {
+                if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                    return Key::Click(m.column as usize, m.row as usize);
+                }
+                continue;
             }
-            continue;
-        }
-        if let Ok(Event::Key(k)) = event::read() {
-            if k.kind != KeyEventKind::Press { continue; }
-            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-            let word = ctrl || k.modifiers.contains(KeyModifiers::ALT);
-            let key = match k.code {
-                KeyCode::Enter => Key::Enter,
-                KeyCode::Left => Key::Left(word),
-                KeyCode::Right => Key::Right(word),
-                KeyCode::Up => Key::Up(word),
-                KeyCode::Down => Key::Down(word),
-                KeyCode::Backspace if ctrl => Key::BackspaceWord,
-                KeyCode::Backspace => Key::Backspace,
-                KeyCode::Delete => Key::Delete,
-                KeyCode::Home => Key::Home,
-                KeyCode::End => Key::End,
-                KeyCode::Esc => Key::Esc,
-                KeyCode::PageUp => Key::PageUp,
-                KeyCode::PageDown => Key::PageDown,
-                KeyCode::Char(c) => Key::Char(c, ctrl),
-                _ => Key::Other,
-            };
-            return key;
+            Ok(Event::Key(k)) => {
+                if k.kind != KeyEventKind::Press { continue; }
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                let word = ctrl || k.modifiers.contains(KeyModifiers::ALT);
+                return match k.code {
+                    KeyCode::Enter => Key::Enter,
+                    KeyCode::Left => Key::Left(word),
+                    KeyCode::Right => Key::Right(word),
+                    KeyCode::Up => Key::Up(word),
+                    KeyCode::Down => Key::Down(word),
+                    KeyCode::Backspace if ctrl => Key::BackspaceWord,
+                    KeyCode::Backspace => Key::Backspace,
+                    KeyCode::Delete => Key::Delete,
+                    KeyCode::Home => Key::Home,
+                    KeyCode::End => Key::End,
+                    KeyCode::Esc => Key::Esc,
+                    KeyCode::PageUp => Key::PageUp,
+                    KeyCode::PageDown => Key::PageDown,
+                    KeyCode::Char(c) => Key::Char(c, ctrl),
+                    _ => Key::Other,
+                };
+            }
+            Err(_) => return Key::Esc,
+            _ => continue, // focus/paste events: ignore, keep reading
         }
     }
 }
