@@ -18,6 +18,7 @@ use std::os::windows::process::CommandExt;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 mod markdown;
@@ -357,6 +358,9 @@ impl Client {
         let mut tokens = 0u64;
         let mut thinking_header = false;
         for line in io::BufReader::new(reader).lines() {
+            if INTERRUPTED.swap(false, Ordering::SeqCst) {
+                return Err("interrupted (Ctrl+C)".into());
+            }
             let line = line.map_err(|e| format!("stream read error: {e}"))?;
             if !line.starts_with("data:") { continue; }
             let data = line[5..].trim();
@@ -791,6 +795,15 @@ fn load_session(client: &mut Client, path: &Path) -> Result<(), String> {
     let file: SessionFile = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     client.messages = file.messages;
     Ok(())
+}
+
+fn session_jump_hint(typed: &str, list: &[(PathBuf, String)]) -> String {
+    if typed.is_empty() { return String::new(); }
+    match typed.parse::<usize>() {
+        Ok(i) if i < list.len() => format!(" -> [{}] {}", i, list[i].1),
+        Ok(_) => format!("  (no session {typed}; only 0-{})", list.len().saturating_sub(1)),
+        Err(_) => String::new(),
+    }
 }
 
 /// Rebuild the visible conversation from the stored messages so restoring a
@@ -1844,6 +1857,20 @@ impl App {
                 let (cols, rows) = term_size();
                 let result = client.chat_stream(&mut |delta| {
                     partial.push_str(delta);
+                    // While generating, keep collecting keys so typing never
+                    // feels dropped, and let Ctrl+C interrupt the turn.
+                    while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+                        if let Ok(Event::Key(k)) = event::read() {
+                            if k.kind != KeyEventKind::Press { continue; }
+                            if k.modifiers.contains(KeyModifiers::CONTROL)
+                                && matches!(k.code, KeyCode::Char('c'))
+                            {
+                                INTERRUPTED.store(true, Ordering::SeqCst);
+                            } else if let KeyCode::Char(c) = k.code {
+                                pending_input().lock().unwrap().push(c);
+                            }
+                        }
+                    }
                     // For grammar-on replies the answer lives inside the
                     // reply.text JSON, so stream that field as prose instead
                     // of typing the JSON or dropping the answer entirely.
@@ -1979,13 +2006,16 @@ impl App {
         }
     }
 
-    fn draw_session_picker(&self, typed: &str) {
+    fn draw_session_picker(&self, typed: &str, notice: &str) {
         let (cols, _) = term_size();
         let mut out = String::from("\x1b[H\x1b[2J");
         out.push_str("\x1b[48;5;24m\x1b[97m SESSIONS \x1b[0m  recent conversations\x1b[0m\n");
         out.push_str(&format!("{}\x1b[0K\n", "-".repeat(cols.saturating_sub(1))));
-        out.push_str("  arrows / j k : move   number : jump (type 2 digits for 10+)   Enter : restore   click : open   q : cancel\n");
-        out.push_str(&format!("  jump: {typed}_\n")); // always one row (stable click targets)
+        out.push_str(&format!("  arrows / j k : move   type number : jump   Enter : restore   click : open   q : cancel   [{} shown]\n",
+                              self.session_list.len()));
+        let jump = session_jump_hint(typed, &self.session_list);
+        out.push_str(&format!("  jump: {typed}_{jump}\n")); // one fixed row for stable clicks
+        out.push_str(&format!("  {notice}\n"));
         out.push_str("\n");
         if self.session_list.is_empty() {
             out.push_str("  (no saved sessions yet - chat a little first)\n");
@@ -2198,10 +2228,20 @@ enum Key {
     Delete, Home, End, Esc, PageUp, PageDown, Click(usize, usize), Other,
 }
 
-/// Read one key in raw mode. Raw mode is disabled again before returning, so
-/// Ctrl+C during a generation terminates the process normally.
+/// Raw mode stays on for the whole TUI session. Toggling it around each key
+/// drops characters typed between reads (the console buffers them in cooked
+/// mode), which made typing feel laggy and unresponsive.
+static RAW_MODE: AtomicBool = AtomicBool::new(false);
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static PENDING_INPUT: OnceLock<Mutex<Vec<char>>> = OnceLock::new();
+
+fn pending_input() -> &'static Mutex<Vec<char>> {
+    PENDING_INPUT.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Read one key. Raw mode is already enabled for the whole TUI session.
 fn read_key() -> Key {
-    if enable_raw_mode().is_err() {
+    if !RAW_MODE.load(Ordering::SeqCst) {
         let mut line = String::new();
         return match io::stdin().read_line(&mut line) {
             Ok(0) => Key::Esc,
@@ -2212,7 +2252,6 @@ fn read_key() -> Key {
     loop {
         if let Ok(Event::Mouse(m)) = event::read() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
-                let _ = crossterm::terminal::disable_raw_mode();
                 return Key::Click(m.column as usize, m.row as usize);
             }
             continue;
@@ -2238,7 +2277,6 @@ fn read_key() -> Key {
                 KeyCode::Char(c) => Key::Char(c, ctrl),
                 _ => Key::Other,
             };
-            let _ = crossterm::terminal::disable_raw_mode();
             return key;
         }
     }
@@ -2463,8 +2501,9 @@ fn main() {
     };
 
     if app.tui {
+        // One raw-mode switch for the whole session, not one per keystroke.
+        RAW_MODE.store(enable_raw_mode().is_ok(), Ordering::SeqCst);
         print!("\x1b[?1049h\x1b[?25l");
-    let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
         let _ = io::stdout().flush();
     }
 
@@ -2480,45 +2519,71 @@ fn main() {
                 if app.picking_session {
                     let mut digits = String::new();
                     let mut digit_at = Instant::now();
+                    let mut notice = String::from("Tip: type a number (e.g. 29) or click a row.");
+                    let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
                     loop {
-                        app.draw_session_picker(&digits);
+                        app.draw_session_picker(&digits, &notice);
                         match read_key() {
                         Key::Down(_) | Key::Char('j', false) => {
                             let n = app.session_list.len().saturating_sub(1);
                             app.session_cursor = (app.session_cursor + 1).min(n);
+                            digits.clear();
+                            notice.clear();
                         }
                         Key::Up(_) | Key::Char('k', false) => {
                             app.session_cursor = app.session_cursor.saturating_sub(1);
+                            digits.clear();
+                            notice.clear();
                         }
                         Key::Char(c, false) if c.is_ascii_digit() => {
-                            if digit_at.elapsed() > Duration::from_secs(2) { digits.clear(); }
+                            if digit_at.elapsed() > Duration::from_secs(3) { digits.clear(); }
                             digit_at = Instant::now();
                             digits.push(c);
                             if digits.len() > 3 { digits.remove(0); }
-                            if let Ok(i) = digits.parse::<usize>() {
-                                if i < app.session_list.len() { app.session_cursor = i; }
-                            }
+                            notice.clear();
+                        }
+                        Key::Backspace if !digits.is_empty() => {
+                            digits.pop();
+                            notice.clear();
                         }
                         Key::Char('\t', false) => {
-                            // Tab completes the number immediately.
                             if let Ok(i) = digits.parse::<usize>() {
-                                if i < app.session_list.len() { app.session_cursor = i; }
+                                if i < app.session_list.len() {
+                                    app.session_cursor = i;
+                                    notice = format!("Jumped to [{i}]. Press Enter to restore.");
+                                } else {
+                                    notice = format!("No session {i} (only 0-{}).", app.session_list.len().saturating_sub(1));
+                                }
+                            } else if !digits.is_empty() {
+                                notice = "Type digits only.".into();
                             }
-                            digits.clear();
+                            digit_at = Instant::now();
                         }
                         Key::Click(_col, row) => {
-                            // Picker rows: 0 header, 1 separator, 2 keys,
-                            // 3 jump line, 4 blank, 5+ are sessions.
-                            let idx = row.saturating_sub(5);
+                            // Picker rows: 0 header, 1 sep, 2 keys, 3 jump,
+                            // 4 notice, 5 blank, 6+ are sessions.
+                            let idx = row.saturating_sub(6);
                             if idx < app.session_list.len() {
                                 app.session_cursor = idx;
                                 let path = app.session_list[idx].0.clone();
+                                let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
                                 app.restore_session(&path);
                                 break;
                             }
                         }
                         Key::Enter => {
+                            let target = digits.parse::<usize>().ok();
+                            if let Some(i) = target {
+                                if i >= app.session_list.len() {
+                                    notice = format!("No session {i} (only 0-{}). Try another number.",
+                                                     app.session_list.len().saturating_sub(1));
+                                    digits.clear();
+                                    continue;
+                                }
+                                app.session_cursor = i;
+                            }
                             if let Some((path, _)) = app.session_list.get(app.session_cursor).cloned() {
+                                let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
                                 app.restore_session(&path);
                             } else {
                                 app.picking_session = false;
@@ -2527,12 +2592,17 @@ fn main() {
                         }
                         Key::Esc | Key::Char('q', false) => {
                             app.picking_session = false;
+                            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
                             app.inform("session browse cancelled");
                         }
-                        Key::Char('c', true) => break 'outer,
+                        Key::Char('c', true) => {
+                            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
+                            break 'outer;
+                        }
                         _ => {}
                     }
                     }
+                    let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
                     continue;
                 }
                 if app.picking_model {
@@ -2572,8 +2642,8 @@ fn main() {
                 }
 
                 // Full-screen line editor with a visible block cursor.
-                let mut buf = String::new();
-                let mut cursor = 0usize;
+                let mut buf: String = pending_input().lock().unwrap().drain(..).collect();
+                let mut cursor = buf.len();
                 // Shell-style history walk: None means "editing a fresh line".
                 let mut hist_pos: Option<usize> = None;
                 let mut draft = String::new();
@@ -2750,7 +2820,7 @@ fn main() {
                             app.inform("no saved sessions yet");
                         } else {
                             app.picking_session = true;
-                            if app.tui { app.draw_session_picker(""); }
+                            if app.tui { app.draw_session_picker("", ""); }
                             else {
                                 for (i, (_, title)) in app.session_list.iter().enumerate() {
                                     println!("  [{i}] {title}");
@@ -2792,8 +2862,8 @@ fn main() {
     app.sidecar.stop();   // llama-server lives only as long as this harness
 
     if app.tui {
-        let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
-    print!("\x1b[?25h\x1b[?1049l");
+        if RAW_MODE.swap(false, Ordering::SeqCst) { let _ = crossterm::terminal::disable_raw_mode(); }
+        print!("\x1b[?25h\x1b[?1049l");
         let _ = io::stdout().flush();
     }
 }
@@ -2847,6 +2917,31 @@ mod tool_tests {
         assert_eq!(h[2], ("tool".to_string(), "web.search -> a result".to_string()));
         assert_eq!(h[3].0, "user");
         assert_eq!(h[4], ("assistant".to_string(), "six".to_string()));
+    }
+
+    #[test]
+    fn typing_during_generation_is_buffered() {
+        pending_input().lock().unwrap().clear();
+        {
+            let mut p = pending_input().lock().unwrap();
+            p.push('h'); p.push('i');
+        }
+        let drained: String = pending_input().lock().unwrap().drain(..).collect();
+        assert_eq!(drained, "hi");
+        assert!(pending_input().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_jump_shows_what_was_typed() {
+        let list = vec![
+            (PathBuf::from("a.json"), "alpha".to_string()),
+            (PathBuf::from("b.json"), "beta".to_string()),
+            (PathBuf::from("c.json"), "gamma".to_string()),
+        ];
+        assert_eq!(session_jump_hint("", &list), "");
+        assert_eq!(session_jump_hint("2", &list), " -> [2] gamma");
+        assert!(session_jump_hint("29", &list).contains("no session 29"));
+        assert!(session_jump_hint("29", &list).contains("only 0-2"));
     }
 
     #[test]
