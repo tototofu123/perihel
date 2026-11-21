@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1391,6 +1392,25 @@ fn execute(call: &Value, root: &Path) -> ToolResult {
     }
 }
 
+/// Visible prose of a streaming reply: the text before a tool-call JSON
+/// object, if one has started. The model often emits a short preamble
+/// and then the `{"tool": ...}` call; typing the raw JSON and dropping
+/// it when the round ends reads as the answer flickering between JSON
+/// and rendered text. The JSON is never part of the answer, so the live
+/// view hides it; the stored message is unaffected.
+///
+/// Only a `{` that opens with `"tool"` (allowing the string to still be
+/// streaming in) counts. A brace in code or prose stays visible.
+fn strip_tool_json(partial: &str) -> &str {
+    let Some(start) = partial.find('{') else { return partial };
+    let after = partial[start + 1..].trim_start();
+    if after.is_empty() || "\"tool\"".starts_with(after) || after.starts_with("\"tool\"") {
+        &partial[..start]
+    } else {
+        partial
+    }
+}
+
 fn parse_call(text: &str) -> Option<Value> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
@@ -1620,6 +1640,10 @@ struct App {
     scroll: usize,
     /// Highlighted row in the slash-command menu.
     suggest_cursor: usize,
+    /// Size of the last frame painted. The frame is only fully cleared
+    /// on the first paint or when the size changes; every other repaint
+    /// just moves home and overwrites each row (see frame_inner).
+    last_frame_size: Cell<(usize, usize)>,
 }
 
 impl App {
@@ -1704,13 +1728,26 @@ impl App {
                     Client::new(&base, &model, grammar, thinking),
                 );
                 let mut partial = String::new();
+                let mut last_paint: Option<Instant> = None;
                 let (cols, rows) = term_size();
                 let result = client.chat_stream(&mut |delta| {
                     partial.push_str(delta);
-                    // With a grammar the stream is the tool-call JSON, not the
-                    // answer; only type out prose.
-                    if partial.trim_start().starts_with('{') { return; }
-                    print!("{}", self.frame_inner("", 0, cols, rows, Some(&partial)));
+                    // Hide any tool-call JSON while it streams: the model
+                    // often emits prose, then the {"tool": ...} call. Typing
+                    // the raw JSON and dropping it when the round ends reads
+                    // as the answer flickering between JSON and rendered
+                    // text. The JSON is never part of the answer.
+                    let visible = strip_tool_json(&partial);
+                    if visible.trim().is_empty() { return; }
+                    // Throttle repaints: a full-frame redraw per token is
+                    // what flashed the bottom of the screen. ~12 fps is
+                    // plenty for a typewriter; the final message is painted
+                    // in full by add() when the stream ends.
+                    if last_paint.is_some_and(|t| t.elapsed() < Duration::from_millis(80)) {
+                        return;
+                    }
+                    last_paint = Some(Instant::now());
+                    print!("{}", self.frame_inner("", 0, cols, rows, Some(visible)));
                     let _ = io::stdout().flush();
                 });
                 self.client = client;
@@ -1796,7 +1833,7 @@ impl App {
         let (cols, _) = term_size();
         let mut out = String::from("\x1b[H\x1b[2J");
         out.push_str(&format!("\x1b[48;5;24m\x1b[97m SELECT MODEL \x1b[0m  {}\x1b[0m\n", self.client.model));
-        out.push_str(&format!("{}\n", "-".repeat(cols.saturating_sub(1))));
+        out.push_str(&format!("{}\x1b[0K\n", "-".repeat(cols.saturating_sub(1))));
         out.push_str("  arrows / j k : move   number : jump   Enter : select   q : cancel\n\n");
         for (i, m) in self.model_list.iter().enumerate() {
             let ptr = if i == self.model_cursor { "\x1b[32m>\x1b[0m" } else { " " };
@@ -1815,7 +1852,7 @@ impl App {
         let (cols, _) = term_size();
         let mut out = String::from("\x1b[H\x1b[2J");
         out.push_str("\x1b[48;5;24m\x1b[97m SESSIONS \x1b[0m  recent conversations\x1b[0m\n");
-        out.push_str(&format!("{}\n", "-".repeat(cols.saturating_sub(1))));
+        out.push_str(&format!("{}\x1b[0K\n", "-".repeat(cols.saturating_sub(1))));
         out.push_str("  arrows / j k : move   number : jump   Enter : restore   q : cancel\n\n");
         if self.session_list.is_empty() {
             out.push_str("  (no saved sessions yet - chat a little first)\n");
@@ -1857,11 +1894,23 @@ impl App {
         let mut out = String::new();
         // Autowrap off while drawing: every row is pre-wrapped, and a line that
         // ends exactly at the edge must not push the rest of the frame down.
-        out.push_str("\x1b[?7l\x1b[0m\x1b[2J\x1b[H");
+        // No full clear on every frame: the TUI runs on the alternate screen
+        // (blank when entered) and the frame always paints the same number
+        // of rows, so cursor-home plus erase-to-end-of-line per row is
+        // enough. Clearing the whole screen on every repaint is what made
+        // the bottom of the screen flash while streaming. Clear once on
+        // the first paint and again whenever the size changes (a resize
+        // can leave ghost rows below a shorter frame).
+        out.push_str("\x1b[?7l\x1b[0m");
+        if self.last_frame_size.get() != (cols, rows) {
+            out.push_str("\x1b[2J");
+        }
+        self.last_frame_size.set((cols, rows));
+        out.push_str("\x1b[H");
         let header = format!(" PERIHEL  local agent harness  model:{}  grammar:{}  tools:{}",
             &self.client.model, if self.client.grammar.is_some() {"ON"} else {"OFF"}, TOOLS.len());
-        out.push_str(&format!("\x1b[48;5;24m\x1b[97m{}\x1b[0m\n", clip_plain(&header, cols.saturating_sub(1))));
-        out.push_str(&format!("{}\n", "-".repeat(cols.saturating_sub(1))));
+        out.push_str(&format!("\x1b[48;5;24m\x1b[97m{}\x1b[0m\x1b[0K\n", clip_plain(&header, cols.saturating_sub(1))));
+        out.push_str(&format!("{}\x1b[0K\n", "-".repeat(cols.saturating_sub(1))));
         let mut lines: Vec<String> = Vec::new();
         let mut last_kind: Option<&str> = None;
         for (kind, text) in &self.history {
@@ -1890,7 +1939,13 @@ impl App {
         }
         if let Some(partial) = stream {
             if !partial.trim().is_empty() {
-                for (i, seg) in markdown::render(partial, cols.saturating_sub(3)).iter().enumerate() {
+                // Plain wrap while streaming, not markdown: re-rendering the
+                // growing partial through markdown on every frame shifts
+                // wrapping and indentation as the text grows (an unclosed
+                // fence swallows the tail until it closes), which reads as
+                // the answer jumping around. Markdown is applied once, on
+                // the stored message, when the stream ends.
+                for (i, seg) in wrap(partial, cols.saturating_sub(3)).iter().enumerate() {
                     lines.push(format!("{}{}", if i == 0 { "\x1b[1;36m*\x1b[0m " } else { "  " }, seg));
                 }
             }
@@ -1909,7 +1964,7 @@ impl App {
         for _ in 0..body_h.saturating_sub(end - start) {
             out.push_str("\x1b[2K\n");
         }
-        out.push_str(&format!("{}\n", "-".repeat(cols.saturating_sub(1))));
+        out.push_str(&format!("{}\x1b[0K\n", "-".repeat(cols.saturating_sub(1))));
         if !suggestions.is_empty() {
             out.push_str(&format!("{}\n", clip_ansi("\x1b[1m  commands\x1b[0m\x1b[2m   up/down select, tab complete, enter run\x1b[0m", cols)));
             for (i, (name, desc)) in suggestions.iter().enumerate() {
@@ -1937,7 +1992,7 @@ impl App {
             let stats = format!(" | {}", self.client.last_stats);
             if disp_width_in(&bar) + disp_width_in(&stats) + 2 <= cols { bar.push_str(&stats); }
         }
-        out.push_str(&format!("\x1b[48;5;236m\x1b[97m{}\x1b[0m\n", clip_plain(&bar, cols.saturating_sub(1))));
+        out.push_str(&format!("\x1b[48;5;236m\x1b[97m{}\x1b[0m\x1b[0K\n", clip_plain(&bar, cols.saturating_sub(1))));
         out.push_str("\x1b[2K\x1b[32m>\x1b[0m "); // clear the input line first
         // Horizontal scroll so a long line never wraps into the status bar.
         let c = cursor.min(input.len());
@@ -2264,6 +2319,7 @@ fn main() {
         busy: false,
         scroll: 0,
         suggest_cursor: 0,
+        last_frame_size: Cell::new((0, 0)),
     };
 
     if app.tui {
@@ -2673,6 +2729,59 @@ mod tool_tests {
     }
 
     #[test]
+    fn stream_hides_tool_call_json_but_keeps_prose() {
+        assert_eq!(strip_tool_json("hello"), "hello");
+        assert_eq!(strip_tool_json("Let me check. {\"tool\": \"web.fetch\""), "Let me check. ");
+        assert_eq!(strip_tool_json("{\"tool\": \"web.fetch\", \"args\": {}"), "");
+        assert_eq!(strip_tool_json("{\"to"), "", "a half-streamed \"tool\" still counts");
+        assert_eq!(strip_tool_json("Here is a struct { x: 1 }"), "Here is a struct { x: 1 }", "a brace in code stays visible");
+        assert_eq!(strip_tool_json("code: { \"name\": 1 }"), "code: { \"name\": 1 }");
+    }
+
+    fn test_app() -> App {
+        App {
+            client: Client::new("http://127.0.0.1:1", "tiny-model", None, false),
+            sidecar: Sidecar::new("http://127.0.0.1:1", Path::new(".")),
+            root: PathBuf::from("."),
+            max_rounds: 0,
+            tui: true,
+            round: 1,
+            history: vec![],
+            picking_model: false,
+            model_list: vec![],
+            model_cursor: 0,
+            picking_session: false,
+            session_list: vec![],
+            session_cursor: 0,
+            session_id: "t".to_string(),
+            busy: false,
+            scroll: 0,
+            suggest_cursor: 0,
+            last_frame_size: Cell::new((0, 0)),
+        }
+    }
+
+    #[test]
+    fn frame_clears_once_then_repaints_without_clearing() {
+        let app = test_app();
+        let first = app.frame_with_size("", 0, 64, 20);
+        assert!(first.contains("\x1b[2J"), "first paint must clear");
+        let second = app.frame_with_size("", 0, 64, 20);
+        assert!(!second.contains("\x1b[2J"), "repeat paint at the same size must not clear: {second:?}");
+        assert!(second.starts_with("\x1b[?7l\x1b[0m\x1b[H"), "repeat paint still homes the cursor");
+        let resized = app.frame_with_size("", 0, 80, 24);
+        assert!(resized.contains("\x1b[2J"), "a resize must clear again so no ghost rows survive");
+    }
+
+    #[test]
+    fn stream_partial_renders_plain_not_markdown() {
+        let app = test_app();
+        let frame = app.frame_inner("", 0, 64, 20, Some("**bold** and `code`"));
+        assert!(frame.contains("**bold**"), "streaming text must stay literal, not styled mid-stream");
+        assert!(frame.contains("`code`"), "backticks must survive until the final markdown render");
+    }
+
+    #[test]
     fn js_shell_detection_catches_minified_code() {
         assert!(looks_like_js_shell("(function(){try{var d=document.documentElement"));
         assert!(looks_like_js_shell("window.dataLayer = window.dataLayer || [];"));
@@ -2861,6 +2970,7 @@ mod layout_tests {
             busy: false,
             scroll: 0,
             suggest_cursor: 0,
+            last_frame_size: Cell::new((0, 0)),
         };
         for (cols, rows) in [(30usize, 10usize), (40, 12), (64, 24), (120, 40)] {
             let frame = app.frame_with_size("/mo", 3, cols, rows);
@@ -2897,6 +3007,7 @@ mod layout_tests {
             busy: false,
             scroll: 0,
             suggest_cursor: 0,
+            last_frame_size: Cell::new((0, 0)),
         };
         for (cols, rows) in [(40usize, 30usize), (64, 30)] {
             let frame = app.frame_with_size("", 0, cols, rows);
@@ -2948,6 +3059,7 @@ mod layout_tests {
             busy: false,
             scroll: 0,
             suggest_cursor: 0,
+            last_frame_size: Cell::new((0, 0)),
         };
         let frame = app.frame_with_size("", 0, 64, 20);
         let assistant_part: String = frame.lines().filter(|l| !l.contains("stay raw")).collect::<Vec<_>>().join("\n");
@@ -3001,6 +3113,7 @@ mod layout_tests {
             picking_model: false, model_list: vec![], model_cursor: 0,
             picking_session: false, session_list: vec![], session_cursor: 0,
             session_id: "t".to_string(), busy: false, scroll: 0, suggest_cursor: 0,
+            last_frame_size: Cell::new((0, 0)),
             sidecar: Sidecar::new("http://127.0.0.1:1", Path::new(".")),
         };
         scroll_lines(&mut app, 3);
@@ -3028,6 +3141,7 @@ mod layout_tests {
             picking_model: false, model_list: vec![], model_cursor: 0,
             picking_session: false, session_list: vec![], session_cursor: 0,
             session_id: "t".to_string(), busy: false, scroll: 0, suggest_cursor: 0,
+            last_frame_size: Cell::new((0, 0)),
         };
         let frame = app.frame_with_size("", 0, 64, 30);
         assert!(frame.contains("\x1b[1;32m>"), "bold green user marker");
@@ -3059,6 +3173,7 @@ mod layout_tests {
             busy: false,
             scroll: 0,
             suggest_cursor: 0,
+            last_frame_size: Cell::new((0, 0)),
         };
         let frame = app.frame_with_size("", 0, 64, 24);
         let line = frame.lines().find(|l| l.contains("hello there"))
@@ -3091,6 +3206,7 @@ mod layout_tests {
             busy: false,
             scroll: 0,
             suggest_cursor: 0,
+            last_frame_size: Cell::new((0, 0)),
         };
         let newest = app.frame_with_size("", 0, 64, 24);
         assert!(newest.contains("line 39"), "newest view should show the last line");
@@ -3122,6 +3238,7 @@ mod layout_tests {
             busy: false,
             scroll: 0,
             suggest_cursor: 2,
+            last_frame_size: Cell::new((0, 0)),
         };
         let frame = app.frame_with_size("/", 1, 64, 24);
         let selected = frame.lines().find(|l| l.contains("/session")).expect("/session row");
