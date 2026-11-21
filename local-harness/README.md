@@ -167,7 +167,10 @@ smoke-tested end to end without leaving the machine.
 llama.cpp has no native tool-call API, so `tools.gbnf` is embedded in the binary
 and sent as the `grammar` field of `/v1/chat/completions`. The sampler physically
 cannot emit an unknown tool or malformed arguments. One JSON tool call per turn;
-its result is fed back as a user message (Perihel `copilot.rs` pattern).
+its result is fed back as a user message (Perihel `copilot.rs` pattern). Calls
+wrapped in ```json fences or cut off mid-stream are recovered; a genuinely
+malformed call is reported as an error instead of being dumped into the chat as
+the answer.
 
 Tools: `fs.list`, `fs.read`, `fs.write`, `fs.mkdir`, `fs.copy`, `run.cmd`,
 `run.bg`, `run.logs`, `run.stop`, `run.test`, `web.search`, `web.fetch`,

@@ -1411,15 +1411,69 @@ fn strip_tool_json(partial: &str) -> &str {
     }
 }
 
+/// Pull a JSON string value out of `key`, tolerating escapes and a string that
+/// was cut off before its closing quote (stream truncated at max_tokens).
+fn json_string_after_key(s: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let pos = s.find(&pat)? + pat.len();
+    let rest = &s[pos..];
+    let colon = rest.find(':')?;
+    let rest = rest[colon + 1..].trim_start();
+    if !rest.starts_with('"') { return None; }
+    let mut out = String::new();
+    let mut chars = rest[1..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'), '\\' => out.push('\\'), '/' => out.push('/'),
+                'n' => out.push('\n'), 'r' => out.push('\r'), 't' => out.push('\t'),
+                'b' => out.push('\u{8}'), 'f' => out.push('\u{c}'),
+                'u' => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Ok(n) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(n) { out.push(ch); }
+                    }
+                }
+                other => out.push(other),
+            },
+            other => out.push(other),
+        }
+    }
+    Some(out) // truncated stream: keep the text we did receive
+}
+
 fn parse_call(text: &str) -> Option<Value> {
+    // Models frequently wrap calls in ```json fences or add prose before them.
     let start = text.find('{')?;
-    let end = text.rfind('}')?;
+    // A stream can be cut off before the closing brace; keep what arrived.
+    let end = text.rfind('}').unwrap_or(text.len().saturating_sub(1));
     if end <= start { return None; }
-    let obj: Value = serde_json::from_str(&text[start..=end]).ok()?;
-    let tool = obj.get("tool")?.as_str()?;
-    if !TOOLS.contains(&tool) { return None; }
-    if !obj.get("args")?.is_object() { return None; }
-    Some(obj)
+    let slice = &text[start..=end];
+    if let Ok(obj) = serde_json::from_str::<Value>(slice) {
+        if let Some(tool) = obj.get("tool").and_then(|v| v.as_str()) {
+            if TOOLS.contains(&tool) && obj.get("args").and_then(|v| v.as_object()).is_some() {
+                return Some(obj);
+            }
+        }
+    }
+    // A stream cut off mid-JSON is still often a complete reply.text payload.
+    if slice.contains("\"reply.text\"") {
+        if let Some(text) = json_string_after_key(slice, "text") {
+            return Some(json!({"tool": "reply.text", "args": {"text": text}}));
+        }
+    }
+    None
+}
+
+/// Never dump a malformed tool-call JSON document into the chat as "the answer".
+fn assistant_display(raw: &str) -> String {
+    let text = raw.trim();
+    if text.contains("\"tool\"") && text.contains('{') {
+        "The model returned an invalid tool call. No action was taken; please try again or simplify the task.".to_string()
+    } else {
+        text.to_string()
+    }
 }
 
 // ------------------------------------------------------------------ llama sidecar
@@ -1770,8 +1824,12 @@ impl App {
             let call = match parse_call(&raw) {
                 Some(c) => c,
                 None => {
-                    if !self.tui { println!("[assistant] {}", raw.trim()); }
-                    self.add("assistant", raw.trim());
+                    let text = assistant_display(&raw);
+                    if !self.tui { println!("[assistant] {text}"); }
+                    // Keep non-tool answers in the conversation so the next
+                    // turn can see them and sessions save the real answer.
+                    self.client.messages.push(json!({"role":"assistant","content":text.clone()}));
+                    self.add("assistant", &text);
                     return;
                 }
             };
@@ -1780,6 +1838,7 @@ impl App {
             if name == "reply.text" {
                 let text = call["args"]["text"].as_str().unwrap_or("").to_string();
                 if !self.tui { println!("[assistant] {text}"); }
+                self.client.messages.push(json!({"role":"assistant","content":text.clone()}));
                 self.add("assistant", &text);
                 return;
             }
@@ -2663,6 +2722,21 @@ mod tool_tests {
         assert_eq!(items.len(), 1);
         assert!(items[0].contains("13 degrees Celsius"), "{:?}", items);
         assert!(items[0].contains("91 per cent"), "{:?}", items);
+    }
+
+    #[test]
+    fn malformed_or_fenced_tool_calls_are_handled() {
+        let fenced = "```json\n{\"tool\":\"reply.text\",\"args\":{\"text\":\"hello\"}}\n```";
+        let call = parse_call(fenced).expect("fenced tool call must parse");
+        assert_eq!(call["args"]["text"], "hello");
+
+        let truncated = r#"{"tool":"reply.text","args":{"text":"partial with \"quotes\" and newline\n""#;
+        let call = parse_call(truncated).expect("truncated reply.text must be recovered");
+        assert_eq!(call["args"]["text"], "partial with \"quotes\" and newline\n");
+
+        assert!(parse_call("plain prose without a tool call").is_none());
+        assert!(assistant_display("{\"tool\":\"reply.text\", broken").contains("invalid tool call"));
+        assert_eq!(assistant_display("just an answer"), "just an answer");
     }
 
     #[test]
