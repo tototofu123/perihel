@@ -358,9 +358,6 @@ impl Client {
         let mut tokens = 0u64;
         let mut thinking_header = false;
         for line in io::BufReader::new(reader).lines() {
-            if INTERRUPTED.swap(false, Ordering::SeqCst) {
-                return Err("interrupted (Ctrl+C)".into());
-            }
             let line = line.map_err(|e| format!("stream read error: {e}"))?;
             if !line.starts_with("data:") { continue; }
             let data = line[5..].trim();
@@ -1816,6 +1813,10 @@ impl App {
     }
 
     fn run_turn(&mut self, user: &str) {
+        // Suspend raw mode while the model generates: Ctrl+C then reaches the
+        // OS as SIGINT and stops even a slow/hung stream instantly. The guard
+        // restores raw mode on every exit path for responsive typing at the prompt.
+        let _raw = if self.tui { suspend_raw_mode() } else { RawModeGuard(false) };
         // Pick up MEMORY.md edits and notes added by the previous turn.
         refresh_system(&mut self.client, &self.root);
         // llama-server is started here — on the first request, never at launch.
@@ -1857,38 +1858,6 @@ impl App {
                 let (cols, rows) = term_size();
                 let result = client.chat_stream(&mut |delta| {
                     partial.push_str(delta);
-                    // While generating, only Ctrl+C is handled now. Every
-                    // other key is deferred so the editor processes it later
-                    // in the same order it was typed (no half-written lines).
-                    while event::poll(Duration::from_millis(0)).unwrap_or(false) {
-                        if let Ok(Event::Key(k)) = event::read() {
-                            if k.kind != KeyEventKind::Press { continue; }
-                            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                            if ctrl && matches!(k.code, KeyCode::Char('c')) {
-                                INTERRUPTED.store(true, Ordering::SeqCst);
-                                continue;
-                            }
-                            let word = ctrl || k.modifiers.contains(KeyModifiers::ALT);
-                            let key = match k.code {
-                                KeyCode::Enter => Key::Enter,
-                                KeyCode::Left => Key::Left(word),
-                                KeyCode::Right => Key::Right(word),
-                                KeyCode::Up => Key::Up(word),
-                                KeyCode::Down => Key::Down(word),
-                                KeyCode::Backspace if ctrl => Key::BackspaceWord,
-                                KeyCode::Backspace => Key::Backspace,
-                                KeyCode::Delete => Key::Delete,
-                                KeyCode::Home => Key::Home,
-                                KeyCode::End => Key::End,
-                                KeyCode::Esc => Key::Esc,
-                                KeyCode::PageUp => Key::PageUp,
-                                KeyCode::PageDown => Key::PageDown,
-                                KeyCode::Char(c) => Key::Char(c, ctrl),
-                                _ => Key::Other,
-                            };
-                            deferred_keys().lock().unwrap().push_back(key);
-                        }
-                    }
                     // For grammar-on replies the answer lives inside the
                     // reply.text JSON, so stream that field as prose instead
                     // of typing the JSON or dropping the answer entirely.
@@ -2250,18 +2219,34 @@ enum Key {
 /// drops characters typed between reads (the console buffers them in cooked
 /// mode), which made typing feel laggy and unresponsive.
 static RAW_MODE: AtomicBool = AtomicBool::new(false);
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-static DEFERRED_KEYS: OnceLock<Mutex<VecDeque<Key>>> = OnceLock::new();
 
-fn deferred_keys() -> &'static Mutex<VecDeque<Key>> {
-    DEFERRED_KEYS.get_or_init(|| Mutex::new(VecDeque::new()))
+/// While a model is generating we switch raw mode OFF: Ctrl+C must reach the
+/// OS as SIGINT so it can kill a slow or hung generation instantly. The guard
+/// restores raw mode on every exit path so typing stays responsive when idle.
+struct RawModeGuard(bool);
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            RAW_MODE.store(true, Ordering::SeqCst);
+            let _ = crossterm::terminal::enable_raw_mode();
+        }
+    }
 }
 
-/// Read one key. Keys typed while a reply was streaming were deferred here by
-/// the stream callback, so the editor sees them in order exactly as if the
-/// user had typed them while idle (including Enter and Backspace).
+fn suspend_raw_mode() -> RawModeGuard {
+    if RAW_MODE.swap(false, Ordering::SeqCst) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        RawModeGuard(true)
+    } else {
+        RawModeGuard(false)
+    }
+}
+
+/// Read one key. Raw mode is enabled while at the input prompt, so every
+/// keypress is delivered immediately (no cooked-mode line buffer eating fast
+/// typing). During generation raw mode is suspended so Ctrl+C is a real SIGINT.
 fn read_key() -> Key {
-    if let Some(k) = deferred_keys().lock().unwrap().pop_front() { return k; }
     if !RAW_MODE.load(Ordering::SeqCst) {
         let mut line = String::new();
         return match io::stdin().read_line(&mut line) {
@@ -2941,23 +2926,13 @@ mod tool_tests {
     }
 
     #[test]
-    fn keys_typed_during_generation_are_deferred_in_order() {
-        deferred_keys().lock().unwrap().clear();
+    fn raw_mode_guard_restores_raw_mode() {
+        RAW_MODE.store(true, Ordering::SeqCst);
         {
-            let mut q = deferred_keys().lock().unwrap();
-            q.push_back(Key::Char('t', false));
-            q.push_back(Key::Char('e', false));
-            q.push_back(Key::Backspace);
-            q.push_back(Key::Char('s', false));
-            q.push_back(Key::Enter);
+            let _raw = suspend_raw_mode();
+            assert!(!RAW_MODE.load(Ordering::SeqCst), "raw off during generation");
         }
-        // read_key() hands them to the editor in the original order.
-        assert!(matches!(read_key(), Key::Char('t', false)));
-        assert!(matches!(read_key(), Key::Char('e', false)));
-        assert!(matches!(read_key(), Key::Backspace));
-        assert!(matches!(read_key(), Key::Char('s', false)));
-        assert!(matches!(read_key(), Key::Enter));
-        assert!(deferred_keys().lock().unwrap().is_empty());
+        assert!(RAW_MODE.load(Ordering::SeqCst), "raw restored after generation");
     }
 
     #[test]
