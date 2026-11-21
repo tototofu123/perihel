@@ -42,6 +42,7 @@ Tools:
 - {"tool":"web.search","args":{"query":"latest news"}}  keyless web search (Bing RSS)
 - {"tool":"web.fetch","args":{"url":"https://example.com"}}  fetch a page as readable text
 - {"tool":"memory.add","args":{"scope":"local","text":"..."}}  append a note to MEMORY.md (scope: local|global)
+- {"tool":"task.run","args":{"task":"..."}}  delegate a self-contained subtask to a fresh subagent (isolated context, same model; returns its final answer)
 - {"tool":"reply.text","args":{"text":"..."}}  finish the turn
 Rules: one tool per reply; paths are relative to the workspace, no absolute paths or `..`;
 inspect before writing, verify after writing; never claim success you did not verify.
@@ -68,7 +69,7 @@ The Memory section below is your persistent notes file; trust it and keep it cur
 const TOOLS: &[&str] = &[
     "fs.list", "fs.read", "fs.write", "fs.mkdir", "fs.copy",
     "run.cmd", "run.bg", "run.logs", "run.stop", "run.test",
-    "web.search", "web.fetch", "memory.add", "reply.text",
+    "web.search", "web.fetch", "memory.add", "task.run", "reply.text",
 ];
 
 const COMMANDS: &[(&str, &str)] = &[
@@ -126,6 +127,12 @@ struct Cli {
     /// Show the model's streamed reasoning (off by default; slow).
     #[arg(long)]
     thinking: bool,
+    /// Internal: quiet one-shot mode used by a parent agent's task.run.
+    #[arg(long, hide = true)]
+    subagent: bool,
+    /// Internal: a subagent cannot spawn further subagents.
+    #[arg(long, hide = true)]
+    no_delegate: bool,
 }
 
 // ------------------------------------------------------------------ client
@@ -1427,6 +1434,11 @@ fn execute(call: &Value, root: &Path) -> ToolResult {
             let msg = memory_add(root, scope, text)?;
             Ok(ToolResult { ok: true, output: msg, refused: None })
         })()),
+        "task.run" => wrap((|| {
+            let task = arg_str(args, "task")?;
+            let msg = run_subagent(task)?;
+            Ok(ToolResult { ok: true, output: msg, refused: None })
+        })()),
         _ => ToolResult { ok: false, output: String::new(), refused: Some(format!("unknown tool: {name}")) },
     }
 }
@@ -1738,6 +1750,44 @@ fn resolve_gguf(root: &Path, name: &str) -> Option<PathBuf> {
         return candidates.into_iter().next();
     }
     candidates.into_iter().find(|p| p.to_string_lossy().to_lowercase().contains(&wanted))
+}
+
+/// How a parent agent launches its subagents (same server/model/workspace).
+static SUBAGENT: OnceLock<(String, String)> = OnceLock::new();
+
+fn set_subagent_config(base: &str, model: &str) {
+    let _ = SUBAGENT.set((base.to_string(), model.to_string()));
+}
+
+fn subagent_disabled() -> bool {
+    std::env::args().any(|a| a == "--no-delegate")
+}
+
+/// Run a self-contained subtask in a fresh, isolated agent process. No shared
+/// conversation context, no nested subagents, bounded rounds and time.
+fn run_subagent(task: &str) -> Result<String, String> {
+    if subagent_disabled() {
+        return Err("subagents are disabled inside a subagent".into());
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let (base, model) = SUBAGENT.get().cloned().unwrap_or_else(|| ("http://127.0.0.1:8090".into(), "local-model".into()));
+    let mut cmd = Command::new(exe);
+    cmd.args([
+        "--cli", "--subagent", "--no-delegate",
+        "--base-url", &base, "--model", &model,
+        "--max-rounds", "8", "--prompt", task,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    let out = cmd.output().map_err(|e| format!("cannot start subagent: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("subagent exited with {}: {}", out.status,
+            String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() { return Err("subagent returned no answer".into()); }
+    Ok(format!("subagent result for {:?}:\n{}", truncate_chars(task, 120), truncate_chars(&text, 4000)))
 }
 
 // ------------------------------------------------------------------ agent
@@ -2485,6 +2535,9 @@ fn main() {
             client.model = first;
         }
     }
+    let model_name = client.model.clone();
+    set_subagent_config(&cli.base_url, &model_name);
+
     let mut app = App {
         client,
         sidecar: Sidecar::new(&cli.base_url, &root),
@@ -2513,11 +2566,11 @@ fn main() {
         let _ = io::stdout().flush();
     }
 
-    banner(&app);
+    if !cli.subagent { banner(&app); }
 
     if let Some(prompt) = &cli.prompt {
         app.run_turn(prompt);
-        app.save_current_session();
+        if !cli.subagent { app.save_current_session(); }
     } else {
         'outer: loop {
             let cmd: String;
@@ -2923,6 +2976,14 @@ mod tool_tests {
         assert_eq!(h[2], ("tool".to_string(), "web.search -> a result".to_string()));
         assert_eq!(h[3].0, "user");
         assert_eq!(h[4], ("assistant".to_string(), "six".to_string()));
+    }
+
+    #[test]
+    fn task_run_is_a_valid_tool_call() {
+        let call = parse_call(r#"{"tool":"task.run","args":{"task":"summarize the repo"}}"#).unwrap();
+        assert_eq!(call["tool"], "task.run");
+        assert_eq!(call["args"]["task"], "summarize the repo");
+        assert!(TOOLS.contains(&"task.run"));
     }
 
     #[test]
