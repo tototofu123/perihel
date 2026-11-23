@@ -28,12 +28,20 @@ Sections — defaults, each configurable (see below):
     article is dropped and replaced; a failed feed is skipped and
     the other feeds fill in. Every item carries a subheading with
     its source and publish date AND time (HKT) next to the link.
-  - Repos: open PRs and open issues (most recently updated first, max 5
-    each) for PERIHEL_DIGEST_REPOS (comma-separated owner/repo;
-    default agent-bus, perihel-v2, hkust-climbing-app), via the GitHub
-    REST API. Unauthenticated (60 req/hour) is enough for a daily
-    digest of public repos; a read-only github.key is needed only for
-    private repos.
+  - Repos: open PRs and open issues (most recently updated first) for
+    every repo in PERIHEL_DIGEST_ORGS (default HKUST-Climbing-Society)
+    and every repo of PERIHEL_DIGEST_USERS (default tototofu123), plus
+    the explicit PERIHEL_DIGEST_REPOS list (default agent-bus,
+    perihel-v2, hkust-climbing-app) — so the digest covers the whole
+    society org and the owner's personal repos, not just three names.
+    The section shows at most 3 items per repo and 20 lines total, so
+    dozens of repos still fit in one message; quiet repos collapse to
+    one line. Via the GitHub REST API. Unauthenticated (60 req/hour)
+    is enough for a daily digest of public repos; a read-only
+    github.key is needed for private repos — and the key only sees the
+    repos it was granted, so a private repo outside the key's scope
+    simply never appears (an explicit repo it cannot read is reported
+    as unreachable instead).
   - Plans: plans.md in DATA_DIR (one plan per line) if it exists; else
     the top open issues across the configured repos, with a note that
     plans.md is missing.
@@ -59,6 +67,8 @@ PLANS_PATH = os.path.join(DATA_DIR, "plans.md")
 
 DEFAULT_REPOS = ["tototofu123/agent-bus", "tototofu123/perihel-v2",
                  "HKUST-Climbing-Society/hkust-climbing-app"]
+DEFAULT_ORGS = ["HKUST-Climbing-Society"]
+DEFAULT_USERS = ["tototofu123"]
 # Trusted news sources, read straight from their own RSS/Atom feeds.
 # (name, feed URL). A feed that fails or has nothing fresh is skipped
 # and the others fill in. Reuters is NOT here: it blocks fetches
@@ -82,7 +92,12 @@ FEED_MAX_ITEMS = 4  # newest items taken from each feed (top 2 first,
 SUMMARY_MAX_CHARS = 380  # per-item summary cap — the whole digest
                          # must fit in ONE Telegram message (4096
                          # chars), so summaries stay to 2 sentences
-REPO_MAX_ITEMS = 5        # per repo, per kind (PRs / issues)
+REPO_MAX_ITEMS = 5        # per repo, per kind (PRs / issues) fetched
+REPO_SHOW_ITEMS = 3       # per repo shown in the digest (merged
+                          # PRs+issues, most recent first)
+REPO_SECTION_MAX_LINES = 20  # whole repos section: headers + items +
+                             # summary lines, so dozens of repos still
+                             # fit in one Telegram message
 PLANS_MAX_LINES = 10
 GITHUB_TIMEOUT_S = 15
 GITHUB_UA = "Perihel-Digest"
@@ -103,21 +118,113 @@ def db():
 
 # ---------------- config ----------------
 
+def parse_names(value: str | None) -> list[str]:
+    """Comma-separated plain names (orgs, users). Blanks dropped."""
+    return [p.strip() for p in (value or "").split(",") if p.strip()]
+
+
 def parse_repos(value: str | None) -> list[str]:
     """Comma-separated owner/repo list (PERIHEL_DIGEST_REPOS). Junk
-    entries (no slash, extra slashes, blanks) are dropped; an empty
-    result falls back to DEFAULT_REPOS."""
+    entries (no slash, extra slashes, blanks) are dropped. An empty
+    result is an empty list — get_repos() applies the fallback."""
     repos = []
     for part in (value or "").split(","):
         part = part.strip()
         if part.count("/") == 1 and not part.startswith("/") \
                 and not part.endswith("/"):
             repos.append(part)
-    return repos or list(DEFAULT_REPOS)
+    return repos
 
 
-def get_repos() -> list[str]:
-    return parse_repos(os.environ.get("PERIHEL_DIGEST_REPOS"))
+def _repo_names(payload) -> list[str]:
+    """A /repos list response -> [full_name]. Pure."""
+    out = []
+    for item in payload or []:
+        if isinstance(item, dict) and item.get("full_name"):
+            out.append(item["full_name"])
+    return out
+
+
+def list_org_repos(org: str) -> list[str]:
+    """All repos of one org the token can see (public + private with
+    access). Never raises: a failure returns []."""
+    try:
+        return _repo_names(github_get(
+            f"https://api.github.com/orgs/{org}/repos"
+            "?per_page=100&type=all&sort=updated"))
+    except Exception:
+        return []
+
+
+def _token_owner() -> str | None:
+    """The github.key token's login, or None. One call; never raises."""
+    try:
+        me = github_get("https://api.github.com/user")
+        return me.get("login") if isinstance(me, dict) else None
+    except Exception:
+        return None
+
+
+def list_user_repos(user: str) -> list[str]:
+    """All repos of one user the token can see. For the token owner
+    this includes private repos (/user/repos); for anyone else it is
+    their public repos. Never raises: a failure returns []."""
+    try:
+        if _token_owner() == user:
+            url = "https://api.github.com/user/repos"
+        else:
+            url = f"https://api.github.com/users/{user}/repos"
+        return _repo_names(github_get(
+            url + "?per_page=100&type=all&sort=updated"))
+    except Exception:
+        return []
+
+
+def get_repos() -> tuple[list[str], list[str]]:
+    """Every repo the digest covers: the explicit PERIHEL_DIGEST_REPOS
+    list, plus every repo in PERIHEL_DIGEST_ORGS (default
+    HKUST-Climbing-Society) and every repo of PERIHEL_DIGEST_USERS
+    (default tototofu123). Returns (repos, notes): duplicates are
+    dropped — the same repo listed twice, or perihel vs perihel-v2
+    after the rename (the API returns the canonical name) — and a
+    note names each org/user whose listing came back empty, so a
+    token that cannot see the society org says so instead of the org
+    silently vanishing. An env var set to empty disables that source;
+    when the combination is empty, fall back to DEFAULT_REPOS, so a
+    failed listing never empties the digest."""
+    seen = set()
+    repos = []
+    notes = []
+
+    def add(name: str):
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            repos.append(name)
+
+    for repo in parse_repos(os.environ.get("PERIHEL_DIGEST_REPOS")):
+        add(repo)
+    orgs = (parse_names(os.environ["PERIHEL_DIGEST_ORGS"])
+            if "PERIHEL_DIGEST_ORGS" in os.environ else list(DEFAULT_ORGS))
+    for org in orgs:
+        listed = list_org_repos(org)
+        if not listed:
+            notes.append(f"{org}: no repos visible — the github.key "
+                         "token has no access to this org yet (or the "
+                         "listing failed)")
+        for repo in listed:
+            add(repo)
+    users = (parse_names(os.environ["PERIHEL_DIGEST_USERS"])
+             if "PERIHEL_DIGEST_USERS" in os.environ else list(DEFAULT_USERS))
+    for user in users:
+        listed = list_user_repos(user)
+        if not listed:
+            notes.append(f"{user}: no repos visible — the github.key "
+                         "token has no access to this user yet (or the "
+                         "listing failed)")
+        for repo in listed:
+            add(repo)
+    return (repos or list(DEFAULT_REPOS), notes)
 
 
 # ---------------- GitHub ----------------
@@ -197,6 +304,16 @@ def _github_error_note(repo: str, e: Exception) -> str:
             return f"{repo}: GitHub denied access (403)"
         return f"{repo}: GitHub returned HTTP {e.code}"
     return f"{repo}: GitHub request failed ({type(e).__name__})"
+
+
+def _repo_latest(summary) -> str:
+    """Most recent updated_at across a repo summary's pulls+issues, or
+    "" when there are none. Pure. Groups are ordered newest-first by
+    this, so the render cap and the shedding loop drop the stalest
+    repos first."""
+    times = [i.get("updated_at") or ""
+             for i in summary["pulls"] + summary["issues"]]
+    return max(times) if times else ""
 
 
 def fetch_repo_summary(repo: str) -> dict:
@@ -611,9 +728,14 @@ def build_digest() -> dict:
     news = fetch_news(get_search_module())
 
     repos = {}
-    for repo in get_repos():
+    repo_list, repo_notes = get_repos()
+    for repo in repo_list:
         repos[repo] = fetch_repo_summary(repo)
     repos_available = any(not v["error"] for v in repos.values())
+    # Order groups by most recent activity, so the shedding loop below
+    # drops the stalest repos first (dict order = activity order).
+    repos = dict(sorted(repos.items(),
+                        key=lambda kv: _repo_latest(kv[1]), reverse=True))
 
     plans = read_plans()
     if plans is None:
@@ -640,16 +762,19 @@ def build_digest() -> dict:
 
     sections = {
         "news": news,
-        "repos": {"available": repos_available, "repos": repos},
+        "repos": {"available": repos_available, "repos": repos,
+                  "notes": repo_notes},
         "plans": plans_data,
     }
     data = {"date": date, "sections": sections}
     data["text"] = format_digest(data)
     # One Telegram message, not two: the cap is 4096 chars, and the
     # bot splits anything longer. Shed the least important parts
-    # first (plans, then the oldest news items) until it fits.
+    # first (plans, then the oldest news items, then the stalest repo
+    # groups — the dict is activity-ordered, so popitem() drops the
+    # least recent) until it fits.
     while len(data["text"]) > TG_CHUNK_LIMIT - 100 and (
-            plans_data["items"] or len(news["items"]) > 3):
+            plans_data["items"] or len(news["items"]) > 3 or len(repos) > 0):
         if plans_data["items"]:
             plans_data["items"] = []
             plans_data["links"] = {}
@@ -657,6 +782,8 @@ def build_digest() -> dict:
         elif len(news["items"]) > 3:
             news["items"] = news["items"][:-1]
             news["count"] = len(news["items"])
+        elif repos:
+            repos.popitem()
         data["text"] = format_digest(data)
     return data
 
@@ -700,17 +827,54 @@ def format_digest(data: dict) -> str:
 
     # --- repos ---
     lines.append("<b>📋 Repos — open PRs &amp; issues</b>")
-    for repo, summary in sections["repos"]["repos"].items():
-        lines.append(f"<b>{_esc(repo)}</b>")
+    for note in sections["repos"].get("notes", []):
+        lines.append(f"<i>{_esc(note)}</i>")
+    repos = sections["repos"]["repos"]
+    # Groups ordered newest-first by latest activity (the dict may
+    # arrive in any order — build_digest orders it too, for shedding).
+    # Each group shows at most REPO_SHOW_ITEMS, newest first across
+    # PRs and issues; the whole section is capped so dozens of repos
+    # still fit in one message. Quiet repos collapse to one line; a
+    # group that would overflow the cap is counted in the "more repos"
+    # line instead.
+    used = 0
+    shown_groups = 0
+    active_left = 0
+    quiet = 0
+    errors = []
+    ordered = sorted(repos.items(),
+                     key=lambda kv: _repo_latest(kv[1]), reverse=True)
+    for repo, summary in ordered:
         if summary["error"]:
-            lines.append(summary["error"])
+            errors.append((repo, summary["error"]))
             continue
+        items = []
         for pr in summary["pulls"]:
-            lines.append(f"• 🔀 PR #{pr['number']}: {_link(pr['url'], pr['title'])}")
+            items.append(("🔀", "PR", pr))
         for issue in summary["issues"]:
-            lines.append(f"• ❗ Issue #{issue['number']}: {_link(issue['url'], issue['title'])}")
-        if not summary["pulls"] and not summary["issues"]:
-            lines.append("• ✅ nothing open")
+            items.append(("❗", "Issue", issue))
+        items.sort(key=lambda t: t[2].get("updated_at") or "", reverse=True)
+        if not items:
+            quiet += 1
+            continue
+        if used + 1 + min(len(items), REPO_SHOW_ITEMS) > REPO_SECTION_MAX_LINES:
+            active_left += 1
+            continue
+        lines.append(f"<b>{_esc(repo)}</b>")
+        used += 1
+        for emoji, kind, item in items[:REPO_SHOW_ITEMS]:
+            lines.append(f"• {emoji} {kind} #{item['number']}: {_link(item['url'], item['title'])}")
+            used += 1
+        shown_groups += 1
+    if active_left:
+        lines.append(f"… +{active_left} more repo{'s' if active_left != 1 else ''} with open items")
+    for repo, error in errors:
+        lines.append(f"<b>{_esc(repo)}</b>")
+        lines.append(error)
+    if quiet:
+        lines.append(f"• ✅ nothing open in {quiet} other repo{'s' if quiet != 1 else ''}")
+    if not shown_groups and not errors and not quiet:
+        lines.append("• no repos configured")
     lines.append("")
 
     # --- plans ---
