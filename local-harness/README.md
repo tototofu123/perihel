@@ -54,11 +54,12 @@ opens**. The first request (or a `/model` switch) starts it, the TUI shows
 session. It is stopped when the harness exits (quit, Ctrl+C, or `--prompt`
 finishing), so no `llama-server.exe` is left behind. An already-running server
 is reused and left alone on exit. GGUF files are discovered in
-`<workspace>/models/`, sibling project folders, `PERIHEL_MODELS_DIR`, and
-`~/.llama/models` — so launching from a folder with no models still finds the
-local Qwen coder model, which is preferred automatically. Override the choice
-with `--model`, `PERIHEL_MODEL` (full path), or `/model`. llama-server is found
-on PATH, under WinGet packages, or via `PERIHEL_LLAMA_SERVER` / `LLAMA_BIN`.
+`<workspace>/models/`, sibling project folders, `PERIHEL_MODELS_DIR`,
+`~/.llama/models`, and (once) a deep scan of `~/Documents`. Every discovered
+GGUF is saved to `~/.perihel/models.json`, so a model found once stays in the
+`/model` picker from **any** workspace. Override the choice with `--model`,
+`PERIHEL_MODEL` (full path), or `/model`. llama-server is found on PATH, under
+WinGet packages, or via `PERIHEL_LLAMA_SERVER` / `LLAMA_BIN`.
 
 The llama.cpp server here runs with `--parallel 1`, so a long generation blocks
 later requests. Keep thinking off for interactive use.
@@ -218,6 +219,22 @@ returned to the parent, so a big research or verification task does not fill
 the main conversation with the subagent's tool chatter. Use it for work that
 stands on its own (e.g. "summarize this repo and list the test commands");
 do not use it for something that needs the current conversation's context.
+
+**Asking you.** `ask.user` lets the model ask a question mid-turn: the TUI
+shows an arrow-key chooser (`up/down` or number, `Enter` to answer) like
+opencode/oh-my-pi, and the answer goes back as the next tool observation.
+
+### What "grammar ON/OFF" means
+
+The GBNF grammar is a sampler constraint sent to llama.cpp: with it **ON**
+(the default), the model physically cannot emit anything except one valid
+`{"tool": "...", "args": {...}}` call per turn — no free prose, no malformed
+JSON. With it **OFF** (`--no-grammar`, used by the remote-server shortcut),
+the model writes freely and Perihel tries to extract a tool call from the
+text. That is less reliable with models that ignore the format, which is why
+local mode keeps the grammar on. A remote server that only knows its own
+model ID is detected automatically: Perihel switches to that ID instead of
+sending a local GGUF name and getting HTTP 404.
 
 The allowlist covers the usual verification commands: `python script.py`,
 `python -m pytest|http.server|py_compile|json.tool`, `node`/`npm`/`npx`

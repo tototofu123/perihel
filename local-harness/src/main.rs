@@ -43,6 +43,7 @@ Tools:
 - {"tool":"web.fetch","args":{"url":"https://example.com"}}  fetch a page as readable text
 - {"tool":"memory.add","args":{"scope":"local","text":"..."}}  append a note to MEMORY.md (scope: local|global)
 - {"tool":"task.run","args":{"task":"..."}}  delegate a self-contained subtask to a fresh subagent (isolated context, same model; returns its final answer)
+- {"tool":"ask.user","args":{"question":"...","choices":["yes","no"]}}  ask the user a question; the TUI shows an arrow-key chooser and returns their answer
 - {"tool":"reply.text","args":{"text":"..."}}  finish the turn
 Rules: one tool per reply; paths are relative to the workspace, no absolute paths or `..`;
 inspect before writing, verify after writing; never claim success you did not verify.
@@ -69,7 +70,7 @@ The Memory section below is your persistent notes file; trust it and keep it cur
 const TOOLS: &[&str] = &[
     "fs.list", "fs.read", "fs.write", "fs.mkdir", "fs.copy",
     "run.cmd", "run.bg", "run.logs", "run.stop", "run.test",
-    "web.search", "web.fetch", "memory.add", "task.run", "reply.text",
+    "web.search", "web.fetch", "memory.add", "task.run", "ask.user", "reply.text",
 ];
 
 const COMMANDS: &[(&str, &str)] = &[
@@ -133,6 +134,9 @@ struct Cli {
     /// Internal: a subagent cannot spawn further subagents.
     #[arg(long, hide = true)]
     no_delegate: bool,
+    /// Internal: a pending question from an `ask.user` tool call, JSON encoded.
+    #[arg(long, hide = true)]
+    ask: Option<String>,
 }
 
 // ------------------------------------------------------------------ client
@@ -218,8 +222,52 @@ fn model_search_dirs(root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Persistent list of GGUFs found anywhere on this machine. Restored on every
+/// launch so a model discovered once stays available from any workspace.
+fn global_model_file() -> PathBuf { perihel_home().join("models.json") }
+
+fn load_models_from(path: &Path) -> Vec<PathBuf> {
+    let text = match fs::read_to_string(path) { Ok(t) => t, Err(_) => return Vec::new() };
+    let arr: Vec<String> = serde_json::from_str(&text).unwrap_or_default();
+    arr.into_iter().map(PathBuf::from).filter(|p| p.exists()).collect()
+}
+
+fn save_models_to(path: &Path, paths: &[PathBuf]) {
+    if let Ok(text) = serde_json::to_string_pretty(
+        &paths.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>()) {
+        if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+        let _ = fs::write(path, text);
+    }
+}
+
+fn load_global_models() -> Vec<PathBuf> { load_models_from(&global_model_file()) }
+fn save_global_models(paths: &[PathBuf]) { save_models_to(&global_model_file(), paths) }
+
+/// Walk a directory tree for GGUFs, bounded so a large home folder is fine.
+fn scan_models_deep(base: &Path, max_depth: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    fn walk(dir: &Path, depth: usize, max: usize, out: &mut Vec<PathBuf>) {
+        if depth > max { return; }
+        let Ok(rd) = fs::read_dir(dir) else { return; };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name == "target" || name == "node_modules" || name == "$Recycle.Bin" { continue; }
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, depth + 1, max, out);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("gguf")
+                && !name.to_lowercase().contains("mmproj")
+            {
+                out.push(p);
+            }
+        }
+    }
+    walk(base, 0, max_depth, &mut out);
+    out
+}
+
 fn discover_models(root: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
+    let mut out = load_global_models();
     for dir in model_search_dirs(root) {
         if let Ok(rd) = fs::read_dir(dir) {
             for e in rd.flatten() {
@@ -232,12 +280,19 @@ fn discover_models(root: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    // Scan the user's project folder once, deeply, so Qwen and other models
+    // are found from any workspace (the registry makes later launches cheap).
+    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        let h = PathBuf::from(home);
+        out.extend(scan_models_deep(&h.join("Documents"), 4));
+    }
     out.sort_by(|a, b| {
         let sa = model_score(&a.file_name().unwrap_or_default().to_string_lossy());
         let sb = model_score(&b.file_name().unwrap_or_default().to_string_lossy());
         sb.cmp(&sa).then_with(|| a.cmp(b))
     });
     out.dedup();
+    save_global_models(&out);
     out
 }
 
@@ -294,6 +349,39 @@ impl Client {
             "stream": stream,
             "chat_template_kwargs": {"enable_thinking": self.thinking},
         })
+    }
+
+    /// Model IDs the server actually has, and the current one if any.
+    fn server_models(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(resp) = self.agent.get(&format!("{}/v1/models", self.base)).call() {
+            if let Ok(v) = resp.into_body().read_json::<Value>() {
+                if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+                    for m in arr {
+                        if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
+                            out.push(id.rsplit(['\\', '/']).next().unwrap_or(id).to_string());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Keep the model in sync with what the server can actually serve. A
+    /// remote server (e.g. on port 18080) only knows its own ID; sending a
+    /// local GGUF name to it returns HTTP 404.
+    fn reconcile_model(&mut self) -> Option<String> {
+        let models = self.server_models();
+        if models.is_empty() { return None; } // no server yet; sidecar handles it
+        let wanted = self.model.trim().to_lowercase();
+        if models.iter().any(|m| m.to_lowercase() == wanted
+            || m.to_lowercase().trim_end_matches(".gguf") == wanted.trim_end_matches(".gguf")) {
+            return None;
+        }
+        let picked = models[0].clone();
+        self.model = picked.clone();
+        Some(picked)
     }
 
     fn chat(&mut self, stream: bool) -> Result<String, String> {
@@ -1439,6 +1527,16 @@ fn execute(call: &Value, root: &Path) -> ToolResult {
             let msg = run_subagent(task)?;
             Ok(ToolResult { ok: true, output: msg, refused: None })
         })()),
+        "ask.user" => wrap((|| {
+            let question = arg_str(args, "question")?.to_string();
+            let choices: Vec<String> = args.get("choices").and_then(|v| v.as_array())
+                .ok_or("choices must be a list of strings")?
+                .iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+            if choices.is_empty() { return Err("choices must not be empty".into()); }
+            let q = UserQuestion { question, choices };
+            let encoded = serde_json::to_string(&q).map_err(|e| e.to_string())?;
+            Ok(ToolResult { ok: true, output: format!("ASK_USER:{encoded}"), refused: None })
+        })()),
         _ => ToolResult { ok: false, output: String::new(), refused: Some(format!("unknown tool: {name}")) },
     }
 }
@@ -1790,6 +1888,44 @@ fn run_subagent(task: &str) -> Result<String, String> {
     Ok(format!("subagent result for {:?}:\n{}", truncate_chars(task, 120), truncate_chars(&text, 4000)))
 }
 
+/// A question the model asked the user, shown as an interactive chooser.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct UserQuestion { question: String, choices: Vec<String> }
+
+fn ask_user_choices(question: &str, choices: &[String]) -> String {
+    let (cols, _) = term_size();
+    let mut selected = 0usize;
+    loop {
+        let mut out = String::from("\x1b[H\x1b[2J");
+        out.push_str("\x1b[48;5;24m\x1b[97m QUESTION \x1b[0m  your model is asking\x1b[0K\n");
+        out.push_str(&format!("{}\x1b[0K\n", "-".repeat(cols.saturating_sub(1))));
+        out.push_str(&format!("\x1b[1m{}\x1b[0m\x1b[0K\n\n", clip_plain(question, cols.saturating_sub(1))));
+        for (i, c) in choices.iter().enumerate() {
+            let ptr = if i == selected { "\x1b[32m>\x1b[0m" } else { " " };
+            let label = if i == selected { format!("\x1b[1;36m{c}\x1b[0m") } else { c.clone() };
+            out.push_str(&format!("  {ptr} [{}] {}\x1b[0K\n", i, clip_ansi(&label, cols.saturating_sub(8))));
+        }
+        out.push_str(&format!("\n{}\x1b[0K\n", "-".repeat(cols.saturating_sub(1))));
+        out.push_str("\x1b[2m  up/down or number : select   Enter : answer\x1b[0m\x1b[0K\n");
+        print!("{out}");
+        let _ = io::stdout().flush();
+        match read_key() {
+            Key::Down(_) | Key::Char('j', false) => selected = (selected + 1).min(choices.len().saturating_sub(1)),
+            Key::Up(_) | Key::Char('k', false) => selected = selected.saturating_sub(1),
+            Key::Char(c, false) if c.is_ascii_digit() => {
+                if let Some(i) = c.to_digit(10) { if (i as usize) < choices.len() { selected = i as usize; } }
+            }
+            Key::Enter => {
+                print!("\x1b[2J\x1b[H");
+                let _ = io::stdout().flush();
+                return choices.get(selected).cloned().unwrap_or_else(|| "yes".into());
+            }
+            Key::Char('c', true) => return "cancelled".into(),
+            _ => {}
+        }
+    }
+}
+
 // ------------------------------------------------------------------ agent
 
 struct App {
@@ -1869,6 +2005,10 @@ impl App {
         let _raw = if self.tui { suspend_raw_mode() } else { RawModeGuard(false) };
         // Pick up MEMORY.md edits and notes added by the previous turn.
         refresh_system(&mut self.client, &self.root);
+        // If the server only serves a different (remote) model, use that one.
+        if let Some(m) = self.client.reconcile_model() {
+            self.inform(&format!("server only has '{m}' - switched model"));
+        }
         // llama-server is started here — on the first request, never at launch.
         let starting = !self.sidecar.is_loaded(&self.client.model);
         if starting {
@@ -1983,6 +2123,24 @@ impl App {
                 _ => {}
             }
             let result = execute(&call, &self.root);
+            // ask.user is a UI request, not an observation for the model.
+            if let Some(encoded) = result.output.strip_prefix("ASK_USER:") {
+                if let Ok(q) = serde_json::from_str::<UserQuestion>(encoded) {
+                    let answer = if self.tui {
+                        ask_user_choices(&q.question, &q.choices)
+                    } else {
+                        println!("{}", q.question);
+                        for (i, c) in q.choices.iter().enumerate() { println!("  [{i}] {c}"); }
+                        let mut line = String::new();
+                        let _ = io::stdin().read_line(&mut line);
+                        let n = line.trim().parse::<usize>().unwrap_or(0);
+                        q.choices.get(n).cloned().unwrap_or_else(|| "cancelled".into())
+                    };
+                    self.add("user", &format!("You chose: {answer}"));
+                    self.client.messages.push(json!({"role":"user","content":format!("User answered your question: {answer}")}));
+                    continue;
+                }
+            }
             if web_tool {
                 if result.ok {
                     web_failures = 0;
@@ -2980,6 +3138,32 @@ mod tool_tests {
         assert_eq!(h[2], ("tool".to_string(), "web.search -> a result".to_string()));
         assert_eq!(h[3].0, "user");
         assert_eq!(h[4], ("assistant".to_string(), "six".to_string()));
+    }
+
+    #[test]
+    fn ask_user_tool_returns_a_chooser_request() {
+        let call = parse_call(r#"{"tool":"ask.user","args":{"question":"Build or test?","choices":["build","test"]}}"#).unwrap();
+        assert_eq!(call["tool"], "ask.user");
+        let args = &call["args"];
+        let question = arg_str(args, "question").unwrap();
+        let choices: Vec<String> = args["choices"].as_array().unwrap().iter()
+            .filter_map(|v| v.as_str().map(str::to_string)).collect();
+        assert_eq!(question, "Build or test?");
+        assert_eq!(choices, vec!["build", "test"]);
+        assert!(TOOLS.contains(&"ask.user"));
+    }
+
+    #[test]
+    fn global_models_persist_across_workspaces() {
+        let dir = std::env::temp_dir().join(format!("perihel-models-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let registry = dir.join("models.json");
+        let real = dir.join("model.gguf");
+        fs::write(&real, b"gguf").unwrap();
+        save_models_to(&registry, &[real.clone()]);
+        assert_eq!(load_models_from(&registry), vec![real]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
