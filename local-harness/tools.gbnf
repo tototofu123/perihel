@@ -5,9 +5,9 @@
 
 root      ::= "{" ws "\"tool\":" ws tool "," ws "\"args\":" ws args "}" ws
 
-tool      ::= "\"fs.list\"" | "\"fs.read\"" | "\"fs.write\"" | "\"fs.mkdir\"" | "\"fs.copy\"" | "\"run.cmd\"" | "\"run.bg\"" | "\"run.logs\"" | "\"run.stop\"" | "\"run.test\"" | "\"web.search\"" | "\"web.fetch\"" | "\"memory.add\"" | "\"task.run\"" | "\"reply.text\""
+tool      ::= "\"fs.list\"" | "\"fs.read\"" | "\"fs.write\"" | "\"fs.mkdir\"" | "\"fs.copy\"" | "\"run.cmd\"" | "\"run.bg\"" | "\"run.logs\"" | "\"run.stop\"" | "\"run.test\"" | "\"web.search\"" | "\"web.fetch\"" | "\"memory.add\"" | "\"task.run\"" | "\"ask.user\"" | "\"reply.text\""
 
-args      ::= path-args | write-args | copy-args | cmd-args | text-args | query-args | url-args | memory-args | id-args | task-args
+args      ::= path-args | write-args | copy-args | cmd-args | text-args | query-args | url-args | memory-args | id-args | task-args | ask-args
 
 path-args ::= "{" ws "\"path\":" ws string ws "}"
 copy-args ::= "{" ws "\"src\":" ws string "," ws "\"dst\":" ws string ws "}"
@@ -20,6 +20,7 @@ memory-args ::= "{" ws "\"scope\":" ws scope "," ws "\"text\":" ws string ws "}"
 scope     ::= "\"global\"" | "\"local\""
 id-args   ::= "{" ws "\"id\":" ws string ws "}"
 task-args ::= "{" ws "\"task\":" ws string ws "}"
+ask-args  ::= "{" ws "\"question\":" ws string "," ws "\"choices\":" ws "[" ws string-list ws "]" ws "}"
 
 string-list ::= string ( ws "," ws string )*
 
