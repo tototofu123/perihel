@@ -28,20 +28,22 @@ Sections — defaults, each configurable (see below):
     article is dropped and replaced; a failed feed is skipped and
     the other feeds fill in. Every item carries a subheading with
     its source and publish date AND time (HKT) next to the link.
-  - Repos: open PRs and open issues (most recently updated first) for
-    every repo in PERIHEL_DIGEST_ORGS (default HKUST-Climbing-Society)
-    and every repo of PERIHEL_DIGEST_USERS (default tototofu123), plus
-    the explicit PERIHEL_DIGEST_REPOS list (default agent-bus,
-    perihel-v2, hkust-climbing-app) — so the digest covers the whole
-    society org and the owner's personal repos, not just three names.
-    The section shows at most 3 items per repo and 20 lines total, so
-    dozens of repos still fit in one message; quiet repos collapse to
-    one line. Via the GitHub REST API. Unauthenticated (60 req/hour)
-    is enough for a daily digest of public repos; a read-only
-    github.key is needed for private repos — and the key only sees the
-    repos it was granted, so a private repo outside the key's scope
-    simply never appears (an explicit repo it cannot read is reported
-    as unreachable instead).
+  - Repos: what changed in the last 24 hours across every repo in
+    PERIHEL_DIGEST_ORGS (default HKUST-Climbing-Society) and every
+    repo of PERIHEL_DIGEST_USERS (default tototofu123), plus the
+    explicit PERIHEL_DIGEST_REPOS list — PRs and issues updated in
+    the window, and commits pushed in it, determined live from the
+    GitHub API (nothing hardcoded). A repo with no update in the last
+    24h is left out entirely, not listed as quiet. The section shows
+    at most 3 items per repo and 20 lines total, so dozens of repos
+    still fit in one message. The open PRs/issues are still fetched
+    as well, because the plans fallback (below) needs them. Via the
+    GitHub REST API. Unauthenticated (60 req/hour) is enough for a
+    daily digest of public repos; a read-only github.key is needed
+    for private repos — and the key only sees the repos it was
+    granted, so a private repo outside the key's scope simply never
+    appears (an explicit repo it cannot read is reported as
+    unreachable instead).
   - Plans: plans.md in DATA_DIR (one plan per line) if it exists; else
     the top open issues across the configured repos, with a note that
     plans.md is missing.
@@ -58,7 +60,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 DATA_DIR = os.environ.get("PERIHEL_SYNC_DIR", "/opt/perihel-sync")
 DB_PATH = os.path.join(DATA_DIR, "sync.db")
@@ -93,6 +95,8 @@ SUMMARY_MAX_CHARS = 380  # per-item summary cap — the whole digest
                          # must fit in ONE Telegram message (4096
                          # chars), so summaries stay to 2 sentences
 REPO_MAX_ITEMS = 5        # per repo, per kind (PRs / issues) fetched
+ACTIVITY_WINDOW_HOURS = 24  # repos section: only activity newer
+                            # than this counts as an update
 REPO_SHOW_ITEMS = 3       # per repo shown in the digest (merged
                           # PRs+issues, most recent first)
 REPO_SECTION_MAX_LINES = 20  # whole repos section: headers + items +
@@ -307,13 +311,72 @@ def _github_error_note(repo: str, e: Exception) -> str:
 
 
 def _repo_latest(summary) -> str:
-    """Most recent updated_at across a repo summary's pulls+issues, or
-    "" when there are none. Pure. Groups are ordered newest-first by
-    this, so the render cap and the shedding loop drop the stalest
-    repos first."""
-    times = [i.get("updated_at") or ""
-             for i in summary["pulls"] + summary["issues"]]
+    """Most recent updated_at across a repo's last-24h activity
+    (pulls, issues, commits), or "" when there is none. Pure. Falls
+    back to the open pulls/issues when no activity was fetched.
+    Groups are ordered newest-first by this, so the render cap and
+    the shedding loop drop the stalest repos first."""
+    act = summary.get("activity") or {}
+    items = act.get("pulls", []) + act.get("issues", []) + act.get("commits", [])
+    if not items:
+        items = summary.get("pulls", []) + summary.get("issues", [])
+    times = [i.get("updated_at") or "" for i in items]
     return max(times) if times else ""
+
+
+def parse_commits(payload) -> list[dict]:
+    """A /commits response -> [{sha, title, url, updated_at}]. The
+    title is the commit message's first line. Pure."""
+    out = []
+    for item in payload or []:
+        if not isinstance(item, dict):
+            continue
+        commit = item.get("commit") or {}
+        message = (commit.get("message") or "").strip().splitlines()
+        out.append({"sha": (item.get("sha") or "")[:7],
+                    "title": message[0] if message else "",
+                    "url": item.get("html_url") or "",
+                    "updated_at": (commit.get("committer") or {}).get("date") or ""})
+    return out
+
+
+def activity_since() -> str:
+    """ISO timestamp for the start of the activity window (24h ago,
+    UTC) — the `since` parameter for the GitHub activity calls."""
+    since = datetime.now(timezone.utc) - timedelta(hours=ACTIVITY_WINDOW_HOURS)
+    return since.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fetch_repo_activity(repo: str, since: str) -> dict:
+    """What changed in one repo since `since`: PRs and issues updated
+    in the window (the issues endpoint returns both — items carrying
+    a pull_request key are PRs) plus commits pushed in it, most
+    recently updated first. Never raises: a failed issues call
+    becomes an "error" note for that repo; a failed commits call is
+    best-effort (commits come back empty, the PRs/issues still
+    show)."""
+    base = f"https://api.github.com/repos/{repo}"
+    qs = urllib.parse.urlencode({"state": "all", "since": since,
+                                 "sort": "updated", "direction": "desc",
+                                 "per_page": REPO_MAX_ITEMS})
+    try:
+        payload = github_get(f"{base}/issues?{qs}")
+    except Exception as e:
+        return {"pulls": [], "issues": [], "commits": [],
+                "error": _github_error_note(repo, e)}
+    pr_payload = [i for i in payload
+                  if isinstance(i, dict) and "pull_request" in i]
+    issue_payload = [i for i in payload
+                     if isinstance(i, dict) and "pull_request" not in i]
+    pulls = parse_pulls(pr_payload)
+    issues = parse_issues(issue_payload)
+    try:
+        commits = parse_commits(github_get(
+            f"{base}/commits?{urllib.parse.urlencode({'since': since, 'per_page': REPO_MAX_ITEMS})}"))
+    except Exception:
+        commits = []
+    return {"pulls": pulls, "issues": issues, "commits": commits,
+            "error": None}
 
 
 def fetch_repo_summary(repo: str) -> dict:
@@ -729,8 +792,14 @@ def build_digest() -> dict:
 
     repos = {}
     repo_list, repo_notes = get_repos()
+    since = activity_since()
     for repo in repo_list:
-        repos[repo] = fetch_repo_summary(repo)
+        summary = fetch_repo_summary(repo)
+        # Last-24h activity is what the repos section shows; the open
+        # PRs/issues above are still fetched because the plans fallback
+        # below needs them.
+        summary["activity"] = fetch_repo_activity(repo, since)
+        repos[repo] = summary
     repos_available = any(not v["error"] for v in repos.values())
     # Order groups by most recent activity, so the shedding loop below
     # drops the stalest repos first (dict order = activity order).
@@ -825,56 +894,61 @@ def format_digest(data: dict) -> str:
             lines.append("")
     lines.append("")
 
-    # --- repos ---
-    lines.append("<b>📋 Repos — open PRs &amp; issues</b>")
+    # --- repos: last 24 hours only ---
+    lines.append("<b>📋 Repos — last 24 hours</b>")
     for note in sections["repos"].get("notes", []):
         lines.append(f"<i>{_esc(note)}</i>")
     repos = sections["repos"]["repos"]
     # Groups ordered newest-first by latest activity (the dict may
     # arrive in any order — build_digest orders it too, for shedding).
+    # Only repos with something in the window are shown at all: a repo
+    # with no update in the last 24h is left out, not listed as quiet.
     # Each group shows at most REPO_SHOW_ITEMS, newest first across
-    # PRs and issues; the whole section is capped so dozens of repos
-    # still fit in one message. Quiet repos collapse to one line; a
-    # group that would overflow the cap is counted in the "more repos"
-    # line instead.
+    # PRs, issues and commits; the whole section is capped so dozens
+    # of repos still fit in one message. A group that would overflow
+    # the cap is counted in the "more repos" line instead.
     used = 0
     shown_groups = 0
     active_left = 0
-    quiet = 0
     errors = []
     ordered = sorted(repos.items(),
                      key=lambda kv: _repo_latest(kv[1]), reverse=True)
     for repo, summary in ordered:
-        if summary["error"]:
-            errors.append((repo, summary["error"]))
+        if "activity" in summary:
+            activity = summary["activity"]
+            err = activity.get("error")
+        else:
+            activity = {}
+            err = summary.get("error")
+        if err:
+            errors.append((repo, err))
             continue
         items = []
-        for pr in summary["pulls"]:
-            items.append(("🔀", "PR", pr))
-        for issue in summary["issues"]:
-            items.append(("❗", "Issue", issue))
+        for pr in activity.get("pulls", []):
+            items.append(("🔀", f"PR #{pr['number']}", pr))
+        for issue in activity.get("issues", []):
+            items.append(("❗", f"Issue #{issue['number']}", issue))
+        for commit in activity.get("commits", []):
+            items.append(("📝", commit["sha"], commit))
         items.sort(key=lambda t: t[2].get("updated_at") or "", reverse=True)
         if not items:
-            quiet += 1
-            continue
+            continue  # no update in the last 24h — leave it out
         if used + 1 + min(len(items), REPO_SHOW_ITEMS) > REPO_SECTION_MAX_LINES:
             active_left += 1
             continue
         lines.append(f"<b>{_esc(repo)}</b>")
         used += 1
-        for emoji, kind, item in items[:REPO_SHOW_ITEMS]:
-            lines.append(f"• {emoji} {kind} #{item['number']}: {_link(item['url'], item['title'])}")
+        for emoji, label, item in items[:REPO_SHOW_ITEMS]:
+            lines.append(f"• {emoji} {label}: {_link(item['url'], item['title'])}")
             used += 1
         shown_groups += 1
     if active_left:
-        lines.append(f"… +{active_left} more repo{'s' if active_left != 1 else ''} with open items")
+        lines.append(f"… +{active_left} more repo{'s' if active_left != 1 else ''} with updates in the last 24h")
     for repo, error in errors:
         lines.append(f"<b>{_esc(repo)}</b>")
         lines.append(error)
-    if quiet:
-        lines.append(f"• ✅ nothing open in {quiet} other repo{'s' if quiet != 1 else ''}")
-    if not shown_groups and not errors and not quiet:
-        lines.append("• no repos configured")
+    if not shown_groups and not errors:
+        lines.append("• no repo updates in the last 24h")
     lines.append("")
 
     # --- plans ---
