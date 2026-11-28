@@ -43,6 +43,7 @@ Tools:
 - {"tool":"web.fetch","args":{"url":"https://example.com"}}  fetch a page as readable text
 - {"tool":"memory.add","args":{"scope":"local","text":"..."}}  append a note to MEMORY.md (scope: local|global)
 - {"tool":"task.run","args":{"task":"..."}}  delegate a self-contained subtask to a fresh subagent (isolated context, same model; returns its final answer)
+- {"tool":"ui.open","args":{"target":"index.html"}}  open a workspace file or URL in your default browser so you can see the result
 - {"tool":"ask.user","args":{"question":"...","choices":["yes","no"]}}  ask the user a question; the TUI shows an arrow-key chooser and returns their answer
 - {"tool":"reply.text","args":{"text":"..."}}  finish the turn
 Rules: one tool per reply; paths are relative to the workspace, no absolute paths or `..`;
@@ -65,12 +66,15 @@ The Memory section below is your persistent notes file; trust it and keep it cur
   really serves. Use `run.stop` when done so no port is left hijacked.
 - If a check fails, fix it and check again. If you could not verify something, say exactly
   what is unverified in `reply.text` instead of claiming it works. If several web calls fail,
-  stop guessing URLs and answer with that caveat - do not keep trying new links."#;
+  stop guessing URLs and answer with that caveat - do not keep trying new links.
+- When you build a web page or visual artifact, write it with `fs.write` and then call
+  `ui.open` so the user can see it in their browser. The TUI shows the file content in the
+  tool result, so keep generated files small enough to read there."#;
 
 const TOOLS: &[&str] = &[
     "fs.list", "fs.read", "fs.write", "fs.mkdir", "fs.copy",
     "run.cmd", "run.bg", "run.logs", "run.stop", "run.test",
-    "web.search", "web.fetch", "memory.add", "task.run", "ask.user", "reply.text",
+    "web.search", "web.fetch", "memory.add", "task.run", "ask.user", "ui.open", "reply.text",
 ];
 
 const COMMANDS: &[(&str, &str)] = &[
@@ -1466,7 +1470,8 @@ fn execute(call: &Value, root: &Path) -> ToolResult {
             let content = arg_str(args, "content")?;
             if let Some(parent) = p.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
             fs::write(&p, content).map_err(|e| e.to_string())?;
-            Ok(ToolResult { ok: true, output: format!("wrote {} chars -> {}", content.len(), p.display()), refused: None })
+            let rel = p.strip_prefix(root).unwrap_or(&p).display().to_string();
+            Ok(ToolResult { ok: true, output: format!("wrote {} chars -> {rel}\n{}", content.len(), truncate_chars(content, 4000)), refused: None })
         })()),
         "fs.mkdir" => wrap((|| {
             let p = safe_path(root, arg_str(args, "path")?)?;
@@ -1526,6 +1531,23 @@ fn execute(call: &Value, root: &Path) -> ToolResult {
             let task = arg_str(args, "task")?;
             let msg = run_subagent(task)?;
             Ok(ToolResult { ok: true, output: msg, refused: None })
+        })()),
+        "ui.open" => wrap((|| {
+            let target = arg_str(args, "target")?;
+            let url = if target.starts_with("http://") || target.starts_with("https://") {
+                target.to_string()
+            } else {
+                let p = safe_path(root, target)?;
+                format!("file:///{}", p.to_string_lossy().replace('\\', "/"))
+            };
+            #[cfg(windows)]
+            {
+                let mut cmd = Command::new("cmd");
+                cmd.args(["/C", "start", "", &url])
+                    .stdout(Stdio::null()).stderr(Stdio::null())
+                    .spawn().map_err(|e| format!("cannot open browser: {e}"))?;
+            }
+            Ok(ToolResult { ok: true, output: format!("opened in browser: {url}"), refused: None })
         })()),
         "ask.user" => wrap((|| {
             let question = arg_str(args, "question")?.to_string();
@@ -2152,11 +2174,11 @@ impl App {
                     }
                 }
             }
-            let preview = result.refused.clone().unwrap_or_else(|| result.output.lines().next().unwrap_or("").to_string());
+            let preview = result.refused.clone().unwrap_or_else(|| result.output.clone());
             if !self.tui {
-                println!("[tool] {name} -> {}", truncate_chars(&preview, 160));
+                println!("[tool] {name} -> {}", truncate_chars(&preview, 2000));
             }
-            self.add("tool", &format!("{name} -> {}", truncate_chars(&preview, 160)));
+            self.add("tool", &format!("{name} -> {}", truncate_chars(&preview, 2000)));
             self.client.messages.push(json!({"role":"user","content":result.message()}));
             if self.max_rounds > 0 && round >= self.max_rounds {
                 self.add("error", "round limit reached (--max-rounds)");
@@ -3138,6 +3160,28 @@ mod tool_tests {
         assert_eq!(h[2], ("tool".to_string(), "web.search -> a result".to_string()));
         assert_eq!(h[3].0, "user");
         assert_eq!(h[4], ("assistant".to_string(), "six".to_string()));
+    }
+
+    #[test]
+    fn ui_open_tool_is_valid() {
+        let call = parse_call(r#"{"tool":"ui.open","args":{"target":"index.html"}}"#).unwrap();
+        assert_eq!(call["tool"], "ui.open");
+        assert_eq!(call["args"]["target"], "index.html");
+        assert!(TOOLS.contains(&"ui.open"));
+    }
+
+    #[test]
+    fn fs_write_result_shows_the_written_content() {
+        let root = std::env::temp_dir().join(format!("perihel-write-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let call = parse_call(r#"{"tool":"fs.write","args":{"path":"demo.html","content":"<h1>hi</h1>"}}"#).unwrap();
+        let r = execute(&call, &root);
+        assert!(r.ok, "{}", r.refused.unwrap_or_default());
+        assert!(r.output.contains("wrote"), "output={:?}", r.output);
+        assert!(r.output.contains("demo.html"), "output={:?}", r.output);
+        assert!(r.output.contains("<h1>hi</h1>"), "output={:?}", r.output);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
